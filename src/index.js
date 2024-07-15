@@ -5,6 +5,7 @@ import * as os from "os";
 import * as fs from "fs";
 import * as request from "request";
 import * as compressing from "compressing";
+import path from "path";
 
 function getPlatform()
 {
@@ -74,8 +75,11 @@ async function run()
         let release = version;
         if (version === "latest")
         {
-            const url = "https://github.com/conan-io/conan/releases/latest";
-            request({ url: url, followRedirect: false }, (error, response, body) =>
+            request({
+                url: "https://github.com/conan-io/conan/releases/latest",
+                followRedirect: false
+            },
+            (error, response, body) =>
             {
                 if (!error && response.statusCode === 302)
                 {
@@ -118,14 +122,15 @@ async function run()
             await compressing.tgz.uncompress(buffer, destionation);
         }
 
+        fs.readdirSync(path.join(destionation, "bin")).forEach(file => {
+            console.log(file);
+        });
+
         fs.chmodSync(destionation, "755");
         console.log(`Successfully installed Conan ${release}`);
 
         core.addPath(destionation);
         console.log(`Successfully added Conan to PATH`);
-
-        const payload = JSON.stringify(github.context.payload, undefined, 2);
-        console.debug(`Event payload: ${payload}`);
     }
     catch (error)
     {

@@ -75543,6 +75543,9 @@ __nccwpck_require__.r(__webpack_exports__);
 /* harmony import */ var request__WEBPACK_IMPORTED_MODULE_5__ = __nccwpck_require__(8699);
 /* harmony import */ var request__WEBPACK_IMPORTED_MODULE_5___default = /*#__PURE__*/__nccwpck_require__.n(request__WEBPACK_IMPORTED_MODULE_5__);
 /* harmony import */ var compressing__WEBPACK_IMPORTED_MODULE_6__ = __nccwpck_require__(5822);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_7__ = __nccwpck_require__(1017);
+/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_7___default = /*#__PURE__*/__nccwpck_require__.n(path__WEBPACK_IMPORTED_MODULE_7__);
+
 
 
 
@@ -75619,8 +75622,11 @@ async function run()
         let release = version;
         if (version === "latest")
         {
-            const url = "https://github.com/conan-io/conan/releases/latest";
-            request__WEBPACK_IMPORTED_MODULE_5__({ url: url, followRedirect: false }, (error, response, body) =>
+            request__WEBPACK_IMPORTED_MODULE_5__({
+                url: "https://github.com/conan-io/conan/releases/latest",
+                followRedirect: false
+            },
+            (error, response, body) =>
             {
                 if (!error && response.statusCode === 302)
                 {
@@ -75663,14 +75669,15 @@ async function run()
             await compressing__WEBPACK_IMPORTED_MODULE_6__.tgz.uncompress(buffer, destionation);
         }
 
+        fs__WEBPACK_IMPORTED_MODULE_4__.readdirSync(path__WEBPACK_IMPORTED_MODULE_7___default().join(destionation, "bin")).forEach(file => {
+            console.log(file);
+        });
+
         fs__WEBPACK_IMPORTED_MODULE_4__.chmodSync(destionation, "755");
         console.log(`Successfully installed Conan ${release}`);
 
         _actions_core__WEBPACK_IMPORTED_MODULE_0__.addPath(destionation);
         console.log(`Successfully added Conan to PATH`);
-
-        const payload = JSON.stringify(_actions_github__WEBPACK_IMPORTED_MODULE_1__.context.payload, undefined, 2);
-        console.debug(`Event payload: ${payload}`);
     }
     catch (error)
     {
