@@ -85,7 +85,7 @@ async function run()
                 {
                     const strings = response.headers.location.split('/');
                     release = strings[strings.length - 1];
-                    console.log(`Version: ${release}`);
+                    console.log(`Release: ${release}`);
                 }
                 else if (error)
                 {
@@ -109,6 +109,12 @@ async function run()
         console.debug(`architecture: ${architecture}`);
         console.debug(`url: ${url}`);
 
+        let filename = "conan";
+        if (os.platform() === "win32")
+        {
+            filename = `${filename}.exe`;
+        }
+
         const destionation = "bin";
         await io.mkdirP(destionation);
 
@@ -126,7 +132,8 @@ async function run()
             console.log(file);
         });
 
-        fs.chmodSync(destionation, "755");
+        const filepath = path.join(destionation, filename);
+        fs.chmodSync(filepath, "755");
         console.log(`Successfully installed Conan ${release}`);
 
         core.addPath(destionation);
