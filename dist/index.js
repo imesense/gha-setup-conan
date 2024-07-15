@@ -75574,7 +75574,7 @@ async function extractRelease()
             {
                 const strings = response.headers.location.split('/');
                 const release = strings[strings.length - 1];
-                console.log(`release: ${release}`);
+                _actions_core__WEBPACK_IMPORTED_MODULE_0__.debug(`release: ${release}`);
                 resolve(release);
             }
             else
@@ -75621,7 +75621,7 @@ async function downloadAsBuffer(url)
 {
     return new Promise((resolve, reject) =>
     {
-        console.log(`Downloading file ${url}`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Downloading file ${url}`);
         request__WEBPACK_IMPORTED_MODULE_5__.get({ url, encoding: null }, (error, responce, body) =>
         {
             if (error)
@@ -75636,7 +75636,7 @@ async function downloadAsBuffer(url)
             }
             else
             {
-                console.log(`Download complete`);
+                _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Download complete`);
                 resolve(body);
             }
         });
@@ -75648,7 +75648,7 @@ async function run()
     try
     {
         const version = _actions_core__WEBPACK_IMPORTED_MODULE_0__.getInput("version");
-        console.debug(`version: ${version}`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.debug(`version: ${version}`);
 
         let release = version;
         if (version === "latest")
@@ -75662,9 +75662,9 @@ async function run()
             ? "zip"
             : "tgz";
         const url = `https://github.com/conan-io/conan/releases/download/${release}/conan-${release}-${platform}-${architecture}.${format}`;
-        console.debug(`platform: ${platform}`);
-        console.debug(`architecture: ${architecture}`);
-        console.debug(`url: ${url}`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.debug(`platform: ${platform}`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.debug(`architecture: ${architecture}`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.debug(`url: ${url}`);
 
         let filename = "conan";
         if (os__WEBPACK_IMPORTED_MODULE_3__.platform() === "win32")
@@ -75673,6 +75673,8 @@ async function run()
         }
 
         const destionation = "bin";
+        await _actions_io__WEBPACK_IMPORTED_MODULE_2__.mkdirP(destionation);
+
         const buffer = await downloadAsBuffer(url);
         if (format === "zip")
         {
@@ -75688,10 +75690,10 @@ async function run()
             : destionation;
         const filepath = path__WEBPACK_IMPORTED_MODULE_7___default().join(binaries, filename);
         fs__WEBPACK_IMPORTED_MODULE_4__.chmodSync(filepath, "755");
-        console.log(`Successfully installed Conan ${release}`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Successfully installed Conan ${release}`);
 
         _actions_core__WEBPACK_IMPORTED_MODULE_0__.addPath(binaries);
-        console.log(`Successfully added Conan to PATH`);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.info(`Successfully added Conan to PATH`);
     }
     catch (error)
     {

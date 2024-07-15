@@ -27,7 +27,7 @@ async function extractRelease()
             {
                 const strings = response.headers.location.split('/');
                 const release = strings[strings.length - 1];
-                console.log(`release: ${release}`);
+                core.debug(`release: ${release}`);
                 resolve(release);
             }
             else
@@ -74,7 +74,7 @@ async function downloadAsBuffer(url)
 {
     return new Promise((resolve, reject) =>
     {
-        console.log(`Downloading file ${url}`);
+        core.info(`Downloading file ${url}`);
         request.get({ url, encoding: null }, (error, responce, body) =>
         {
             if (error)
@@ -89,7 +89,7 @@ async function downloadAsBuffer(url)
             }
             else
             {
-                console.log(`Download complete`);
+                core.info(`Download complete`);
                 resolve(body);
             }
         });
@@ -101,7 +101,7 @@ async function run()
     try
     {
         const version = core.getInput("version");
-        console.debug(`version: ${version}`);
+        core.debug(`version: ${version}`);
 
         let release = version;
         if (version === "latest")
@@ -115,9 +115,9 @@ async function run()
             ? "zip"
             : "tgz";
         const url = `https://github.com/conan-io/conan/releases/download/${release}/conan-${release}-${platform}-${architecture}.${format}`;
-        console.debug(`platform: ${platform}`);
-        console.debug(`architecture: ${architecture}`);
-        console.debug(`url: ${url}`);
+        core.debug(`platform: ${platform}`);
+        core.debug(`architecture: ${architecture}`);
+        core.debug(`url: ${url}`);
 
         let filename = "conan";
         if (os.platform() === "win32")
@@ -126,6 +126,8 @@ async function run()
         }
 
         const destionation = "bin";
+        await io.mkdirP(destionation);
+
         const buffer = await downloadAsBuffer(url);
         if (format === "zip")
         {
@@ -141,10 +143,10 @@ async function run()
             : destionation;
         const filepath = path.join(binaries, filename);
         fs.chmodSync(filepath, "755");
-        console.log(`Successfully installed Conan ${release}`);
+        core.info(`Successfully installed Conan ${release}`);
 
         core.addPath(binaries);
-        console.log(`Successfully added Conan to PATH`);
+        core.info(`Successfully added Conan to PATH`);
     }
     catch (error)
     {
