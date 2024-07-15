@@ -75554,6 +75554,37 @@ __nccwpck_require__.r(__webpack_exports__);
 
 
 
+async function extractRelease()
+{
+    return new Promise((resolve, reject) =>
+    {
+        request__WEBPACK_IMPORTED_MODULE_5__.get({
+            url: "https://github.com/conan-io/conan/releases/latest",
+            followRedirect: false
+        },
+        (error, response, body) =>
+        {
+            if (error)
+            {
+                reject(error);
+                return;
+            }
+
+            if (response.statusCode === 302)
+            {
+                const strings = response.headers.location.split('/');
+                const release = strings[strings.length - 1];
+                console.log(`release: ${release}`);
+                resolve(release);
+            }
+            else
+            {
+                reject(new Error(`Recieved ${response.statusCode} from ${url}`));
+            }
+        });
+    });
+}
+
 function getPlatform()
 {
     const platform = os__WEBPACK_IMPORTED_MODULE_3__.platform();
@@ -75622,35 +75653,14 @@ async function run()
         let release = version;
         if (version === "latest")
         {
-            request__WEBPACK_IMPORTED_MODULE_5__({
-                url: "https://github.com/conan-io/conan/releases/latest",
-                followRedirect: false
-            },
-            (error, response, body) =>
-            {
-                if (!error && response.statusCode === 302)
-                {
-                    const strings = response.headers.location.split('/');
-                    release = strings[strings.length - 1];
-                    console.log(`Release: ${release}`);
-                }
-                else if (error)
-                {
-                    console.error(`Error: ${error}`);
-                }
-                else
-                {
-                    console.log(`Status code: ${response.statusCode}`);
-                }
-            });
+            release = await extractRelease();
         }
 
         const platform = getPlatform().toString();
         const architecture = getArchitecture().toString();
-        const format =
-            os__WEBPACK_IMPORTED_MODULE_3__.platform() === "win32"
-                ? "zip"
-                : "tgz";
+        const format = os__WEBPACK_IMPORTED_MODULE_3__.platform() === "win32"
+            ? "zip"
+            : "tgz";
         const url = `https://github.com/conan-io/conan/releases/download/${release}/conan-${release}-${platform}-${architecture}.${format}`;
         console.debug(`platform: ${platform}`);
         console.debug(`architecture: ${architecture}`);
@@ -75663,8 +75673,6 @@ async function run()
         }
 
         const destionation = "bin";
-        await _actions_io__WEBPACK_IMPORTED_MODULE_2__.mkdirP(destionation);
-
         const buffer = await downloadAsBuffer(url);
         if (format === "zip")
         {
@@ -75675,15 +75683,14 @@ async function run()
             await compressing__WEBPACK_IMPORTED_MODULE_6__.tgz.uncompress(buffer, destionation);
         }
 
-        fs__WEBPACK_IMPORTED_MODULE_4__.readdirSync(path__WEBPACK_IMPORTED_MODULE_7___default().join(destionation, "bin")).forEach(file => {
-            console.log(file);
-        });
-
-        const filepath = path__WEBPACK_IMPORTED_MODULE_7___default().join(destionation, filename);
+        const binaries = os__WEBPACK_IMPORTED_MODULE_3__.platform() !== "win32"
+            ? path__WEBPACK_IMPORTED_MODULE_7___default().join(destionation, "bin")
+            : destionation;
+        const filepath = path__WEBPACK_IMPORTED_MODULE_7___default().join(binaries, filename);
         fs__WEBPACK_IMPORTED_MODULE_4__.chmodSync(filepath, "755");
         console.log(`Successfully installed Conan ${release}`);
 
-        _actions_core__WEBPACK_IMPORTED_MODULE_0__.addPath(destionation);
+        _actions_core__WEBPACK_IMPORTED_MODULE_0__.addPath(binaries);
         console.log(`Successfully added Conan to PATH`);
     }
     catch (error)
