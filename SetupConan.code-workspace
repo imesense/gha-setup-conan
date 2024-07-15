@@ -1,0 +1,12 @@
+{
+    "folders": [
+        {
+            "name": "Setup Conan",
+            "path": "."
+        }
+    ],
+    "settings": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "redhat.telemetry.enabled": false
+    }
+}

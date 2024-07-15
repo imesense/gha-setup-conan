@@ -1,0 +1,52 @@
+# Enable top-most EditorConfig file
+root = true
+
+# Markdown documents
+[*.md]
+
+# Common settings
+charset = utf-8
+end_of_line = lf
+indent_size = 2
+indent_style = space
+insert_final_newline = true
+
+# JSON-based files
+[*.{json,code-workspace,XamlStyler,!package*.json}]
+
+# Common settings
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# YAML-based files
+[*.{yml,yaml}]
+
+# Common settings
+charset = utf-8
+end_of_line = lf
+indent_size = 2
+indent_style = space
+insert_final_newline = true
+
+# NPM manifests
+[package*.json]
+
+# Common settings
+charset = utf-8
+end_of_line = lf
+indent_size = 2
+indent_style = space
+insert_final_newline = true
+
+# JavaScript sources
+[{src/*.js,*.mjs}]
+
+# Common settings
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true

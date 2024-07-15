@@ -1,0 +1,17 @@
+name: 'Setup Conan'
+description: 'Action for installing and configuring Conan package manager to PATH of the runner'
+author: 'acidicMercury8'
+
+inputs:
+  input-string:
+    description: 'Input string'
+    required: true
+    default: 'input'
+
+outputs:
+  output-string:
+    description: 'Output string'
+
+runs:
+  using: node20
+  main: dist/index.js
