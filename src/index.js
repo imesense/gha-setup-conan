@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import * as github from "@actions/github";
 import * as io from "@actions/io";
 import * as os from "os";
 import * as fs from "fs";
@@ -68,7 +69,7 @@ async function run()
     try
     {
         const version = core.getInput("version");
-        core.debug(`version: ${version}`);
+        console.debug(`version: ${version}`);
 
         let release = version;
         if (version === "latest")
@@ -100,9 +101,9 @@ async function run()
                 ? "zip"
                 : "tgz";
         const url = `https://github.com/conan-io/conan/releases/download/${release}/conan-${release}-${platform}-${architecture}.${format}`;
-        core.debug(`platform: ${platform}`);
-        core.debug(`architecture: ${architecture}`);
-        core.debug(`url: ${url}`);
+        console.debug(`platform: ${platform}`);
+        console.debug(`architecture: ${architecture}`);
+        console.debug(`url: ${url}`);
 
         const destionation = "bin";
         await io.mkdirP(destionation);
@@ -118,13 +119,18 @@ async function run()
         }
 
         fs.chmodSync(destionation, "755");
-        core.info(`Successfully installed Conan ${release}`);
+        console.log(`Successfully installed Conan ${release}`);
 
         core.addPath(destionation);
-        core.info(`Successfully added Conan to PATH`);
+        console.log(`Successfully added Conan to PATH`);
+
+        const payload = JSON.stringify(github.context.payload, undefined, 2);
+        console.debug(`Event payload: ${payload}`);
     }
     catch (error)
     {
         core.setFailed(error.message);
     }
 }
+
+run();
