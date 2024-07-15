@@ -1,16 +1,12 @@
-name: 'Setup Conan'
+name: 'Setup Conan (ImeSense)'
 description: 'Action for installing and configuring Conan package manager to PATH of the runner'
 author: 'acidicMercury8'
 
 inputs:
-  input-string:
-    description: 'Input string'
-    required: true
-    default: 'input'
-
-outputs:
-  output-string:
-    description: 'Output string'
+  version:
+    description: 'Version of Conan'
+    required: false
+    default: 'latest'
 
 runs:
   using: node20

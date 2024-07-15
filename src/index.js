@@ -1,18 +1,130 @@
 import * as core from "@actions/core";
-import * as github from "@actions/github";
+import * as io from "@actions/io";
+import * as os from "os";
+import * as fs from "fs";
+import * as request from "request";
+import * as compressing from "compressing";
 
-try
+function getPlatform()
 {
-    const input = core.getInput("input-string");
-    console.log(`${input}!`);
-
-    const output = input;
-    core.setOutput("output-string", output);
-
-    const payload = JSON.stringify(github.context.payload, undefined, 2);
-    console.log(`Event payload: ${payload}`);
+    const platform = os.platform();
+    switch (platform)
+    {
+        case "win32":
+            return "windows";
+        case "linux":
+            return "linux";
+        case "darwin":
+            return "macos";
+        default:
+            throw new Error(`Not supported platform!`);
+    }
 }
-catch (error)
+
+function getArchitecture()
 {
-    core.setFailed(error.message);
+    const architecture = os.arch();
+    switch (architecture)
+    {
+        case "ia32":
+            return "i686";
+        case "x64":
+            return "x86_64";
+        case "arm64":
+            return "arm64";
+        default:
+            throw new Error(`Not supported architecture!`);
+    }
+}
+
+async function downloadAsBuffer(url)
+{
+    return new Promise((resolve, reject) =>
+    {
+        console.log(`Downloading file ${url}`);
+        request.get({ url, encoding: null }, (error, responce, body) =>
+        {
+            if (error)
+            {
+                reject(error);
+                return;
+            }
+
+            if (responce.statusCode >= 400)
+            {
+                reject(new Error(`Recieved ${responce.statusCode} from ${url}`));
+            }
+            else
+            {
+                console.log(`Download complete`);
+                resolve(body);
+            }
+        });
+    });
+}
+
+async function run()
+{
+    try
+    {
+        const version = core.getInput("version");
+        core.debug(`version: ${version}`);
+
+        let release = version;
+        if (version === "latest")
+        {
+            const url = "https://github.com/conan-io/conan/releases/latest";
+            request({ url: url, followRedirect: false }, (error, response, body) =>
+            {
+                if (!error && response.statusCode === 302)
+                {
+                    const strings = response.headers.location.split('/');
+                    release = strings[strings.length - 1];
+                    console.log(`Version: ${release}`);
+                }
+                else if (error)
+                {
+                    console.error(`Error: ${error}`);
+                }
+                else
+                {
+                    console.log(`Status code: ${response.statusCode}`);
+                }
+            });
+        }
+
+        const platform = getPlatform().toString();
+        const architecture = getArchitecture().toString();
+        const format =
+            os.platform() === "win32"
+                ? "zip"
+                : "tgz";
+        const url = `https://github.com/conan-io/conan/releases/download/${release}/conan-${release}-${platform}-${architecture}.${format}`;
+        core.debug(`platform: ${platform}`);
+        core.debug(`architecture: ${architecture}`);
+        core.debug(`url: ${url}`);
+
+        const destionation = "bin";
+        await io.mkdirP(destionation);
+
+        const buffer = await downloadAsBuffer(url);
+        if (format === "zip")
+        {
+            await compressing.zip.uncompress(buffer, destionation);
+        }
+        else if (format === "tgz")
+        {
+            await compressing.tgz.uncompress(buffer, destionation);
+        }
+
+        fs.chmodSync(destionation, "755");
+        core.info(`Successfully installed Conan ${release}`);
+
+        core.addPath(destionation);
+        core.info(`Successfully added Conan to PATH`);
+    }
+    catch (error)
+    {
+        core.setFailed(error.message);
+    }
 }
