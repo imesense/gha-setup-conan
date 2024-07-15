@@ -27,7 +27,7 @@ jobs:
     steps:
       - name: Setup Conan
         id: setup-conan
-        uses: imesense/gha-setup-conan@92110f48bea19f1f97e6236da73fd46ebf55d97f
+        uses: imesense/gha-setup-conan@6329ec6d77617f524fe5b981d9187dcb7061a4bc
         with:
           version: '2.5.0'
 
@@ -50,7 +50,7 @@ jobs:
     steps:
       - name: Setup Conan
         id: setup-conan
-        uses: imesense/gha-setup-conan@92110f48bea19f1f97e6236da73fd46ebf55d97f
+        uses: imesense/gha-setup-conan@6329ec6d77617f524fe5b981d9187dcb7061a4bc
 
       - name: Print version
         run: |
