@@ -1,0 +1,57 @@
+name: 'Run action'
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/**'
+      - 'src/**'
+      - 'dist/**'
+      - 'package*.json'
+      - 'action.json'
+
+jobs:
+  setup-version2:
+    name: 'Setup version'
+
+    strategy:
+      matrix:
+        system:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    runs-on: ${{ matrix.system }}
+
+    steps:
+      - name: Setup Conan
+        id: setup-conan
+        uses: imesense/gha-setup-conan@160c1be5b9ca1a34d0244caff9308469dd3ceebf
+        with:
+          version: '2.5.0'
+
+      - name: Print version
+        run: |
+          conan --version
+
+  setup-latest:
+    name: 'Setup latest'
+
+    strategy:
+      matrix:
+        system:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    runs-on: ${{ matrix.system }}
+
+    steps:
+      - name: Setup Conan
+        id: setup-conan
+        uses: imesense/gha-setup-conan@160c1be5b9ca1a34d0244caff9308469dd3ceebf
+
+      - name: Print version
+        run: |
+          conan --version
