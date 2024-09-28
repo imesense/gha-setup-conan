@@ -38,9 +38,9 @@
     "request": "^2.88.2"
   },
   "devDependencies": {
-    "@vercel/ncc": "^0.38.1",
-    "eslint": "^9.5.0",
+    "@vercel/ncc": "^0.38.2",
+    "eslint": "^9.11.1",
     "prettier": "^3.3.2",
-    "prettier-plugin-brace-style": "^0.6.2"
+    "prettier-plugin-brace-style": "^0.7.0"
   }
 }
