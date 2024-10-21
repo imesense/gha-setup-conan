@@ -1,7 +1,7 @@
 # Setup Conan
 
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
-[![Release](https://img.shields.io/github/v/release/imesense/gha-setup-conan?include_prereleases&label=Release)](https://github.com/imesense/gha-setup-conan/releases/tag/v0.1)
+[![Release](https://img.shields.io/github/v/release/imesense/gha-setup-conan?include_prereleases&label=Release)](https://github.com/imesense/gha-setup-conan/releases/latest)
 [![Open in Dev Containers](https://img.shields.io/static/v1?label=Dev%20Containers&message=Open&color=blue&logo=visualstudiocode)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/imesense/gha-setup-conan)
 [![Run action](https://github.com/imesense/gha-setup-conan/actions/workflows/run-action.yml/badge.svg)](https://github.com/imesense/gha-setup-conan/actions/workflows/run-action.yml)
 
