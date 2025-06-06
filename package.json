@@ -28,7 +28,7 @@
     ".": "./dist/index.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20 <21"
   },
   "dependencies": {
     "@actions/core": "^1.11.1",
