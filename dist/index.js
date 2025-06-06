@@ -18053,31 +18053,37 @@ exports.makeUncompressFn = StreamClass => {
           .on('error', reject)
           .on('entry', (header, stream, next) => {
             stream.on('end', next);
+            const destFilePath = path.join(destDir, header.name);
 
             if (header.type === 'file') {
-              const fullpath = path.join(destDir, header.name);
-              mkdirp(path.dirname(fullpath), err => {
+              const dir = path.dirname(destFilePath);
+              mkdirp(dir, err => {
                 if (err) return reject(err);
 
                 entryCount++;
-                pump(stream, fs.createWriteStream(fullpath, { mode: opts.mode || header.mode }), err => {
+                pump(stream, fs.createWriteStream(destFilePath, { mode: opts.mode || header.mode }), err => {
                   if (err) return reject(err);
                   successCount++;
                   done();
                 });
               });
             } else if (header.type === 'symlink') {
-              // symlink
-              const src = path.join(destDir, header.name);
-              const target = path.resolve(path.dirname(src), header.linkname);
+              const dir = path.dirname(destFilePath);
+              const target = path.resolve(dir, header.linkname);
               entryCount++;
-              fs.symlink(target, src, err => {
+
+              mkdirp(dir, err => {
                 if (err) return reject(err);
-                successCount++;
-                stream.resume();
+
+                const relativeTarget = path.relative(dir, target);
+                fs.symlink(relativeTarget, destFilePath, err => {
+                  if (err) return reject(err);
+                  successCount++;
+                  stream.resume();
+                });
               });
             } else { // directory
-              mkdirp(path.join(destDir, header.name), err => {
+              mkdirp(destFilePath, err => {
                 if (err) return reject(err);
                 stream.resume();
               });
@@ -18112,7 +18118,14 @@ function safePipe(streams) {
 
 exports.safePipe = safePipe;
 
-exports.stripFileName = (strip, fileName, type) => {
+function normalizePath(fileName) {
+  fileName = path.normalize(fileName);
+  // https://nodejs.org/api/path.html#path_path_normalize_path
+  if (process.platform === 'win32') fileName = fileName.replace(/\\+/g, '/');
+  return fileName;
+}
+
+function stripFileName(strip, fileName, type) {
   // before
   // node/package.json
   // node/lib/index.js
@@ -18133,15 +18146,18 @@ exports.stripFileName = (strip, fileName, type) => {
   // /foo => foo
   if (fileName[0] === '/') fileName = fileName.replace(/^\/+/, '');
 
+  // fix case
+  // ./foo/bar => foo/bar
+  if (fileName) {
+    fileName = normalizePath(fileName);
+  }
+
   let s = fileName.split('/');
 
   // fix relative path
   // foo/../bar/../../asdf/
   //  => asdf/
   if (s.indexOf('..') !== -1) {
-    fileName = path.normalize(fileName);
-    // https://npm.taobao.org/mirrors/node/latest/docs/api/path.html#path_path_normalize_path
-    if (process.platform === 'win32') fileName = fileName.replace(/\\+/g, '/');
     // replace '../' on ../../foo/bar
     fileName = fileName.replace(/(\.\.\/)+/, '');
     if (type === 'directory' && fileName && fileName[fileName.length - 1] !== '/') {
@@ -18152,7 +18168,9 @@ exports.stripFileName = (strip, fileName, type) => {
 
   strip = Math.min(strip, s.length - 1);
   return s.slice(strip).join('/') || '/';
-};
+}
+
+exports.stripFileName = stripFileName;
 
 
 /***/ }),
