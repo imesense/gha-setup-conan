@@ -17762,7 +17762,7 @@ const tar = __nccwpck_require__(2976);
 const gzip = __nccwpck_require__(9849);
 const utils = __nccwpck_require__(8554);
 const stream = __nccwpck_require__(2203);
-const pump = __nccwpck_require__(7898);
+const { pipeline: pump } = __nccwpck_require__(2203);
 const ready = __nccwpck_require__(5394);
 
 class TgzFileStream extends stream.Transform {
@@ -17946,8 +17946,7 @@ module.exports = TgzUncompressStream;
 
 const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
-const mkdirp = __nccwpck_require__(4469);
-const pump = __nccwpck_require__(7898);
+const { pipeline: pump } = __nccwpck_require__(2203);
 
 // file/fileBuffer/stream
 exports.sourceType = source => {
@@ -18034,7 +18033,7 @@ exports.makeUncompressFn = StreamClass => {
     }
 
     return new Promise((resolve, reject) => {
-      mkdirp(destDir, err => {
+      fs.mkdir(destDir, { recursive: true }, err => {
         if (err) return reject(err);
 
         let entryCount = 0;
@@ -18057,7 +18056,7 @@ exports.makeUncompressFn = StreamClass => {
 
             if (header.type === 'file') {
               const dir = path.dirname(destFilePath);
-              mkdirp(dir, err => {
+              fs.mkdir(dir, { recursive: true }, err => {
                 if (err) return reject(err);
 
                 entryCount++;
@@ -18072,7 +18071,7 @@ exports.makeUncompressFn = StreamClass => {
               const target = path.resolve(dir, header.linkname);
               entryCount++;
 
-              mkdirp(dir, err => {
+              fs.mkdir(dir, { recursive: true }, err => {
                 if (err) return reject(err);
 
                 const relativeTarget = path.relative(dir, target);
@@ -18083,7 +18082,7 @@ exports.makeUncompressFn = StreamClass => {
                 });
               });
             } else { // directory
-              mkdirp(destFilePath, err => {
+              fs.mkdir(destFilePath, { recursive: true }, err => {
                 if (err) return reject(err);
                 stream.resume();
               });
@@ -18317,6 +18316,7 @@ module.exports = ZipStream;
 
 // https://github.com/thejoshwolfe/yauzl#no-streaming-unzip-api
 
+const debug = (__nccwpck_require__(9023).debuglog)('compressing/zip/uncompress_stream');
 const yauzl = __nccwpck_require__(1890);
 const stream = __nccwpck_require__(2203);
 const UncompressBaseStream = __nccwpck_require__(6622);
@@ -18353,12 +18353,20 @@ class ZipUncompressStream extends UncompressBaseStream {
     if (this._zipFileNameEncoding === 'utf-8') {
       this._zipFileNameEncoding = 'utf8';
     }
+    this._finalCallback = err => {
+      if (err) {
+        debug('finalCallback, error: %j', err);
+        return this.emit('error', err);
+      }
+      this.emit('finish');
+    };
 
     this[YAUZL_CALLBACK] = this[YAUZL_CALLBACK].bind(this);
 
     const sourceType = utils.sourceType(opts.source);
 
     const yauzlOpts = this._yauzlOpts = Object.assign({}, DEFAULTS, opts.yauzl);
+    debug('sourceType: %s, yauzlOpts: %j', sourceType, yauzlOpts);
     if (sourceType === 'file') {
       yauzl.open(opts.source, yauzlOpts, this[YAUZL_CALLBACK]);
       return;
@@ -18375,27 +18383,26 @@ class ZipUncompressStream extends UncompressBaseStream {
         .catch(e => this.emit('error', e));
       return;
     }
-
-    this.on('pipe', srcStream => {
-      srcStream.unpipe(srcStream);
-
-      utils.streamToBuffer(srcStream)
-        .then(buf => {
-          this._chunks.push(buf);
-          buf = Buffer.concat(this._chunks);
-          yauzl.fromBuffer(buf, yauzlOpts, this[YAUZL_CALLBACK]);
-        })
-        .catch(e => this.emit('error', e));
-    });
   }
 
-  _write(chunk) {
-    // push to _chunks array, this will only happen once, for stream will be unpiped.
+  _write(chunk, _encoding, callback) {
     this._chunks.push(chunk);
+    debug('write size: %d, chunks: %d', chunk.length, this._chunks.length);
+    callback();
+  }
+
+  _final(callback) {
+    const buf = Buffer.concat(this._chunks);
+    debug('final, buf size: %d, chunks: %d', buf.length, this._chunks.length);
+    this._finalCallback = callback;
+    yauzl.fromBuffer(buf, this._yauzlOpts, this[YAUZL_CALLBACK]);
   }
 
   [YAUZL_CALLBACK](err, zipFile) {
-    if (err) return this.emit('error', err);
+    if (err) {
+      debug('yauzl error', err);
+      return this._finalCallback(err);
+    }
 
     zipFile.readEntry();
 
@@ -18421,17 +18428,22 @@ class ZipUncompressStream extends UncompressBaseStream {
 
         if (type === 'file') {
           zipFile.openReadStream(entry, (err, readStream) => {
-            if (err) return this.emit('error', err);
+            if (err) {
+              debug('file, error: %j', err);
+              return this._finalCallback(err);
+            }
+            debug('file, header: %j', header);
             this.emit('entry', header, readStream, next);
           });
         } else { // directory
           const placeholder = new stream.Readable({ read() {} });
+          debug('directory, header: %j', header);
           this.emit('entry', header, placeholder, next);
           setImmediate(() => placeholder.emit('end'));
         }
       })
-      .on('end', () => this.emit('finish'))
-      .on('error', err => this.emit('error', err));
+      .on('end', () => this._finalCallback())
+      .on('error', err => this._finalCallback(err));
 
     function next() {
       zipFile.readEntry();
@@ -28127,115 +28139,6 @@ function populateMaps (extensions, types) {
 
 /***/ }),
 
-/***/ 4469:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var path = __nccwpck_require__(6928);
-var fs = __nccwpck_require__(9896);
-var _0777 = parseInt('0777', 8);
-
-module.exports = mkdirP.mkdirp = mkdirP.mkdirP = mkdirP;
-
-function mkdirP (p, opts, f, made) {
-    if (typeof opts === 'function') {
-        f = opts;
-        opts = {};
-    }
-    else if (!opts || typeof opts !== 'object') {
-        opts = { mode: opts };
-    }
-    
-    var mode = opts.mode;
-    var xfs = opts.fs || fs;
-    
-    if (mode === undefined) {
-        mode = _0777
-    }
-    if (!made) made = null;
-    
-    var cb = f || /* istanbul ignore next */ function () {};
-    p = path.resolve(p);
-    
-    xfs.mkdir(p, mode, function (er) {
-        if (!er) {
-            made = made || p;
-            return cb(null, made);
-        }
-        switch (er.code) {
-            case 'ENOENT':
-                /* istanbul ignore if */
-                if (path.dirname(p) === p) return cb(er);
-                mkdirP(path.dirname(p), opts, function (er, made) {
-                    /* istanbul ignore if */
-                    if (er) cb(er, made);
-                    else mkdirP(p, opts, cb, made);
-                });
-                break;
-
-            // In the case of any other error, just see if there's a dir
-            // there already.  If so, then hooray!  If not, then something
-            // is borked.
-            default:
-                xfs.stat(p, function (er2, stat) {
-                    // if the stat fails, then that's super weird.
-                    // let the original error be the failure reason.
-                    if (er2 || !stat.isDirectory()) cb(er, made)
-                    else cb(null, made);
-                });
-                break;
-        }
-    });
-}
-
-mkdirP.sync = function sync (p, opts, made) {
-    if (!opts || typeof opts !== 'object') {
-        opts = { mode: opts };
-    }
-    
-    var mode = opts.mode;
-    var xfs = opts.fs || fs;
-    
-    if (mode === undefined) {
-        mode = _0777
-    }
-    if (!made) made = null;
-
-    p = path.resolve(p);
-
-    try {
-        xfs.mkdirSync(p, mode);
-        made = made || p;
-    }
-    catch (err0) {
-        switch (err0.code) {
-            case 'ENOENT' :
-                made = sync(path.dirname(p), opts, made);
-                sync(p, opts, made);
-                break;
-
-            // In the case of any other error, just see if there's a dir
-            // there already.  If so, then hooray!  If not, then something
-            // is borked.
-            default:
-                var stat;
-                try {
-                    stat = xfs.statSync(p);
-                }
-                catch (err1) /* istanbul ignore next */ {
-                    throw err0;
-                }
-                /* istanbul ignore if */
-                if (!stat.isDirectory()) throw err0;
-                break;
-        }
-    }
-
-    return made;
-};
-
-
-/***/ }),
-
 /***/ 2435:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -28868,99 +28771,6 @@ exports.isValid = function (domain) {
   var parsed = exports.parse(domain);
   return Boolean(parsed.domain && parsed.listed);
 };
-
-
-/***/ }),
-
-/***/ 7898:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var once = __nccwpck_require__(5560)
-var eos = __nccwpck_require__(1424)
-var fs
-
-try {
-  fs = __nccwpck_require__(9896) // we only need fs to get the ReadStream and WriteStream prototypes
-} catch (e) {}
-
-var noop = function () {}
-var ancient = /^v?\.0/.test(process.version)
-
-var isFn = function (fn) {
-  return typeof fn === 'function'
-}
-
-var isFS = function (stream) {
-  if (!ancient) return false // newer node version do not need to care about fs is a special way
-  if (!fs) return false // browser
-  return (stream instanceof (fs.ReadStream || noop) || stream instanceof (fs.WriteStream || noop)) && isFn(stream.close)
-}
-
-var isRequest = function (stream) {
-  return stream.setHeader && isFn(stream.abort)
-}
-
-var destroyer = function (stream, reading, writing, callback) {
-  callback = once(callback)
-
-  var closed = false
-  stream.on('close', function () {
-    closed = true
-  })
-
-  eos(stream, {readable: reading, writable: writing}, function (err) {
-    if (err) return callback(err)
-    closed = true
-    callback()
-  })
-
-  var destroyed = false
-  return function (err) {
-    if (closed) return
-    if (destroyed) return
-    destroyed = true
-
-    if (isFS(stream)) return stream.close(noop) // use close for fs streams to avoid fd leaks
-    if (isRequest(stream)) return stream.abort() // request.destroy just do .end - .abort is what we want
-
-    if (isFn(stream.destroy)) return stream.destroy()
-
-    callback(err || new Error('stream was destroyed'))
-  }
-}
-
-var call = function (fn) {
-  fn()
-}
-
-var pipe = function (from, to) {
-  return from.pipe(to)
-}
-
-var pump = function () {
-  var streams = Array.prototype.slice.call(arguments)
-  var callback = isFn(streams[streams.length - 1] || noop) && streams.pop() || noop
-
-  if (Array.isArray(streams[0])) streams = streams[0]
-  if (streams.length < 2) throw new Error('pump requires two streams per minimum')
-
-  var error
-  var destroys = streams.map(function (stream, i) {
-    var reading = i < streams.length - 1
-    var writing = i > 0
-    return destroyer(stream, reading, writing, function (err) {
-      if (!error) error = err
-      if (err) destroys.forEach(call)
-      if (reading) return
-      destroys.forEach(call)
-      callback(error)
-    })
-  })
-
-  return streams.reduce(pipe)
-}
-
-module.exports = pump
 
 
 /***/ }),
