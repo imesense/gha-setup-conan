@@ -1,7 +1,8 @@
 # Global ignoring of different binaries and another temporary files
 
-# Dependencies
-node_modules/
+# NPM cache
+/.npm
+/node_modules
 
 # Logs
 logs
