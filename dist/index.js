@@ -846,809 +846,6 @@ class DecodedURL extends URL {
 
 /***/ }),
 
-/***/ 1890:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-var fs = __nccwpck_require__(9896);
-var zlib = __nccwpck_require__(3106);
-var fd_slicer = __nccwpck_require__(1357);
-var crc32 = __nccwpck_require__(9776);
-var util = __nccwpck_require__(9023);
-var EventEmitter = (__nccwpck_require__(4434).EventEmitter);
-var Transform = (__nccwpck_require__(2203).Transform);
-var PassThrough = (__nccwpck_require__(2203).PassThrough);
-var Writable = (__nccwpck_require__(2203).Writable);
-
-exports.open = open;
-exports.fromFd = fromFd;
-exports.fromBuffer = fromBuffer;
-exports.fromRandomAccessReader = fromRandomAccessReader;
-exports.dosDateTimeToDate = dosDateTimeToDate;
-exports.validateFileName = validateFileName;
-exports.ZipFile = ZipFile;
-exports.Entry = Entry;
-exports.RandomAccessReader = RandomAccessReader;
-
-function open(path, options, callback) {
-  if (typeof options === "function") {
-    callback = options;
-    options = null;
-  }
-  if (options == null) options = {};
-  if (options.autoClose == null) options.autoClose = true;
-  if (options.lazyEntries == null) options.lazyEntries = false;
-  if (options.decodeStrings == null) options.decodeStrings = true;
-  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
-  if (options.strictFileNames == null) options.strictFileNames = false;
-  if (callback == null) callback = defaultCallback;
-  fs.open(path, "r", function(err, fd) {
-    if (err) return callback(err);
-    fromFd(fd, options, function(err, zipfile) {
-      if (err) fs.close(fd, defaultCallback);
-      callback(err, zipfile);
-    });
-  });
-}
-
-function fromFd(fd, options, callback) {
-  if (typeof options === "function") {
-    callback = options;
-    options = null;
-  }
-  if (options == null) options = {};
-  if (options.autoClose == null) options.autoClose = false;
-  if (options.lazyEntries == null) options.lazyEntries = false;
-  if (options.decodeStrings == null) options.decodeStrings = true;
-  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
-  if (options.strictFileNames == null) options.strictFileNames = false;
-  if (callback == null) callback = defaultCallback;
-  fs.fstat(fd, function(err, stats) {
-    if (err) return callback(err);
-    var reader = fd_slicer.createFromFd(fd, {autoClose: true});
-    fromRandomAccessReader(reader, stats.size, options, callback);
-  });
-}
-
-function fromBuffer(buffer, options, callback) {
-  if (typeof options === "function") {
-    callback = options;
-    options = null;
-  }
-  if (options == null) options = {};
-  options.autoClose = false;
-  if (options.lazyEntries == null) options.lazyEntries = false;
-  if (options.decodeStrings == null) options.decodeStrings = true;
-  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
-  if (options.strictFileNames == null) options.strictFileNames = false;
-  // limit the max chunk size. see https://github.com/thejoshwolfe/yauzl/issues/87
-  var reader = fd_slicer.createFromBuffer(buffer, {maxChunkSize: 0x10000});
-  fromRandomAccessReader(reader, buffer.length, options, callback);
-}
-
-function fromRandomAccessReader(reader, totalSize, options, callback) {
-  if (typeof options === "function") {
-    callback = options;
-    options = null;
-  }
-  if (options == null) options = {};
-  if (options.autoClose == null) options.autoClose = true;
-  if (options.lazyEntries == null) options.lazyEntries = false;
-  if (options.decodeStrings == null) options.decodeStrings = true;
-  var decodeStrings = !!options.decodeStrings;
-  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
-  if (options.strictFileNames == null) options.strictFileNames = false;
-  if (callback == null) callback = defaultCallback;
-  if (typeof totalSize !== "number") throw new Error("expected totalSize parameter to be a number");
-  if (totalSize > Number.MAX_SAFE_INTEGER) {
-    throw new Error("zip file too large. only file sizes up to 2^52 are supported due to JavaScript's Number type being an IEEE 754 double.");
-  }
-
-  // the matching unref() call is in zipfile.close()
-  reader.ref();
-
-  // eocdr means End of Central Directory Record.
-  // search backwards for the eocdr signature.
-  // the last field of the eocdr is a variable-length comment.
-  // the comment size is encoded in a 2-byte field in the eocdr, which we can't find without trudging backwards through the comment to find it.
-  // as a consequence of this design decision, it's possible to have ambiguous zip file metadata if a coherent eocdr was in the comment.
-  // we search backwards for a eocdr signature, and hope that whoever made the zip file was smart enough to forbid the eocdr signature in the comment.
-  var eocdrWithoutCommentSize = 22;
-  var maxCommentSize = 0xffff; // 2-byte size
-  var bufferSize = Math.min(eocdrWithoutCommentSize + maxCommentSize, totalSize);
-  var buffer = newBuffer(bufferSize);
-  var bufferReadStart = totalSize - buffer.length;
-  readAndAssertNoEof(reader, buffer, 0, bufferSize, bufferReadStart, function(err) {
-    if (err) return callback(err);
-    for (var i = bufferSize - eocdrWithoutCommentSize; i >= 0; i -= 1) {
-      if (buffer.readUInt32LE(i) !== 0x06054b50) continue;
-      // found eocdr
-      var eocdrBuffer = buffer.slice(i);
-
-      // 0 - End of central directory signature = 0x06054b50
-      // 4 - Number of this disk
-      var diskNumber = eocdrBuffer.readUInt16LE(4);
-      if (diskNumber !== 0) {
-        return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
-      }
-      // 6 - Disk where central directory starts
-      // 8 - Number of central directory records on this disk
-      // 10 - Total number of central directory records
-      var entryCount = eocdrBuffer.readUInt16LE(10);
-      // 12 - Size of central directory (bytes)
-      // 16 - Offset of start of central directory, relative to start of archive
-      var centralDirectoryOffset = eocdrBuffer.readUInt32LE(16);
-      // 20 - Comment length
-      var commentLength = eocdrBuffer.readUInt16LE(20);
-      var expectedCommentLength = eocdrBuffer.length - eocdrWithoutCommentSize;
-      if (commentLength !== expectedCommentLength) {
-        return callback(new Error("invalid comment length. expected: " + expectedCommentLength + ". found: " + commentLength));
-      }
-      // 22 - Comment
-      // the encoding is always cp437.
-      var comment = decodeStrings ? decodeBuffer(eocdrBuffer, 22, eocdrBuffer.length, false)
-                                  : eocdrBuffer.slice(22);
-
-      if (!(entryCount === 0xffff || centralDirectoryOffset === 0xffffffff)) {
-        return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
-      }
-
-      // ZIP64 format
-
-      // ZIP64 Zip64 end of central directory locator
-      var zip64EocdlBuffer = newBuffer(20);
-      var zip64EocdlOffset = bufferReadStart + i - zip64EocdlBuffer.length;
-      readAndAssertNoEof(reader, zip64EocdlBuffer, 0, zip64EocdlBuffer.length, zip64EocdlOffset, function(err) {
-        if (err) return callback(err);
-
-        // 0 - zip64 end of central dir locator signature = 0x07064b50
-        if (zip64EocdlBuffer.readUInt32LE(0) !== 0x07064b50) {
-          return callback(new Error("invalid zip64 end of central directory locator signature"));
-        }
-        // 4 - number of the disk with the start of the zip64 end of central directory
-        // 8 - relative offset of the zip64 end of central directory record
-        var zip64EocdrOffset = readUInt64LE(zip64EocdlBuffer, 8);
-        // 16 - total number of disks
-
-        // ZIP64 end of central directory record
-        var zip64EocdrBuffer = newBuffer(56);
-        readAndAssertNoEof(reader, zip64EocdrBuffer, 0, zip64EocdrBuffer.length, zip64EocdrOffset, function(err) {
-          if (err) return callback(err);
-
-          // 0 - zip64 end of central dir signature                           4 bytes  (0x06064b50)
-          if (zip64EocdrBuffer.readUInt32LE(0) !== 0x06064b50) {
-            return callback(new Error("invalid zip64 end of central directory record signature"));
-          }
-          // 4 - size of zip64 end of central directory record                8 bytes
-          // 12 - version made by                                             2 bytes
-          // 14 - version needed to extract                                   2 bytes
-          // 16 - number of this disk                                         4 bytes
-          // 20 - number of the disk with the start of the central directory  4 bytes
-          // 24 - total number of entries in the central directory on this disk         8 bytes
-          // 32 - total number of entries in the central directory            8 bytes
-          entryCount = readUInt64LE(zip64EocdrBuffer, 32);
-          // 40 - size of the central directory                               8 bytes
-          // 48 - offset of start of central directory with respect to the starting disk number     8 bytes
-          centralDirectoryOffset = readUInt64LE(zip64EocdrBuffer, 48);
-          // 56 - zip64 extensible data sector                                (variable size)
-          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
-        });
-      });
-      return;
-    }
-    callback(new Error("end of central directory record signature not found"));
-  });
-}
-
-util.inherits(ZipFile, EventEmitter);
-function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, autoClose, lazyEntries, decodeStrings, validateEntrySizes, strictFileNames) {
-  var self = this;
-  EventEmitter.call(self);
-  self.reader = reader;
-  // forward close events
-  self.reader.on("error", function(err) {
-    // error closing the fd
-    emitError(self, err);
-  });
-  self.reader.once("close", function() {
-    self.emit("close");
-  });
-  self.readEntryCursor = centralDirectoryOffset;
-  self.fileSize = fileSize;
-  self.entryCount = entryCount;
-  self.comment = comment;
-  self.entriesRead = 0;
-  self.autoClose = !!autoClose;
-  self.lazyEntries = !!lazyEntries;
-  self.decodeStrings = !!decodeStrings;
-  self.validateEntrySizes = !!validateEntrySizes;
-  self.strictFileNames = !!strictFileNames;
-  self.isOpen = true;
-  self.emittedError = false;
-
-  if (!self.lazyEntries) self._readEntry();
-}
-ZipFile.prototype.close = function() {
-  if (!this.isOpen) return;
-  this.isOpen = false;
-  this.reader.unref();
-};
-
-function emitErrorAndAutoClose(self, err) {
-  if (self.autoClose) self.close();
-  emitError(self, err);
-}
-function emitError(self, err) {
-  if (self.emittedError) return;
-  self.emittedError = true;
-  self.emit("error", err);
-}
-
-ZipFile.prototype.readEntry = function() {
-  if (!this.lazyEntries) throw new Error("readEntry() called without lazyEntries:true");
-  this._readEntry();
-};
-ZipFile.prototype._readEntry = function() {
-  var self = this;
-  if (self.entryCount === self.entriesRead) {
-    // done with metadata
-    setImmediate(function() {
-      if (self.autoClose) self.close();
-      if (self.emittedError) return;
-      self.emit("end");
-    });
-    return;
-  }
-  if (self.emittedError) return;
-  var buffer = newBuffer(46);
-  readAndAssertNoEof(self.reader, buffer, 0, buffer.length, self.readEntryCursor, function(err) {
-    if (err) return emitErrorAndAutoClose(self, err);
-    if (self.emittedError) return;
-    var entry = new Entry();
-    // 0 - Central directory file header signature
-    var signature = buffer.readUInt32LE(0);
-    if (signature !== 0x02014b50) return emitErrorAndAutoClose(self, new Error("invalid central directory file header signature: 0x" + signature.toString(16)));
-    // 4 - Version made by
-    entry.versionMadeBy = buffer.readUInt16LE(4);
-    // 6 - Version needed to extract (minimum)
-    entry.versionNeededToExtract = buffer.readUInt16LE(6);
-    // 8 - General purpose bit flag
-    entry.generalPurposeBitFlag = buffer.readUInt16LE(8);
-    // 10 - Compression method
-    entry.compressionMethod = buffer.readUInt16LE(10);
-    // 12 - File last modification time
-    entry.lastModFileTime = buffer.readUInt16LE(12);
-    // 14 - File last modification date
-    entry.lastModFileDate = buffer.readUInt16LE(14);
-    // 16 - CRC-32
-    entry.crc32 = buffer.readUInt32LE(16);
-    // 20 - Compressed size
-    entry.compressedSize = buffer.readUInt32LE(20);
-    // 24 - Uncompressed size
-    entry.uncompressedSize = buffer.readUInt32LE(24);
-    // 28 - File name length (n)
-    entry.fileNameLength = buffer.readUInt16LE(28);
-    // 30 - Extra field length (m)
-    entry.extraFieldLength = buffer.readUInt16LE(30);
-    // 32 - File comment length (k)
-    entry.fileCommentLength = buffer.readUInt16LE(32);
-    // 34 - Disk number where file starts
-    // 36 - Internal file attributes
-    entry.internalFileAttributes = buffer.readUInt16LE(36);
-    // 38 - External file attributes
-    entry.externalFileAttributes = buffer.readUInt32LE(38);
-    // 42 - Relative offset of local file header
-    entry.relativeOffsetOfLocalHeader = buffer.readUInt32LE(42);
-
-    if (entry.generalPurposeBitFlag & 0x40) return emitErrorAndAutoClose(self, new Error("strong encryption is not supported"));
-
-    self.readEntryCursor += 46;
-
-    buffer = newBuffer(entry.fileNameLength + entry.extraFieldLength + entry.fileCommentLength);
-    readAndAssertNoEof(self.reader, buffer, 0, buffer.length, self.readEntryCursor, function(err) {
-      if (err) return emitErrorAndAutoClose(self, err);
-      if (self.emittedError) return;
-      // 46 - File name
-      var isUtf8 = (entry.generalPurposeBitFlag & 0x800) !== 0;
-      entry.fileName = self.decodeStrings ? decodeBuffer(buffer, 0, entry.fileNameLength, isUtf8)
-                                          : buffer.slice(0, entry.fileNameLength);
-
-      // 46+n - Extra field
-      var fileCommentStart = entry.fileNameLength + entry.extraFieldLength;
-      var extraFieldBuffer = buffer.slice(entry.fileNameLength, fileCommentStart);
-      entry.extraFields = [];
-      var i = 0;
-      while (i < extraFieldBuffer.length - 3) {
-        var headerId = extraFieldBuffer.readUInt16LE(i + 0);
-        var dataSize = extraFieldBuffer.readUInt16LE(i + 2);
-        var dataStart = i + 4;
-        var dataEnd = dataStart + dataSize;
-        if (dataEnd > extraFieldBuffer.length) return emitErrorAndAutoClose(self, new Error("extra field length exceeds extra field buffer size"));
-        var dataBuffer = newBuffer(dataSize);
-        extraFieldBuffer.copy(dataBuffer, 0, dataStart, dataEnd);
-        entry.extraFields.push({
-          id: headerId,
-          data: dataBuffer,
-        });
-        i = dataEnd;
-      }
-
-      // 46+n+m - File comment
-      entry.fileComment = self.decodeStrings ? decodeBuffer(buffer, fileCommentStart, fileCommentStart + entry.fileCommentLength, isUtf8)
-                                             : buffer.slice(fileCommentStart, fileCommentStart + entry.fileCommentLength);
-      // compatibility hack for https://github.com/thejoshwolfe/yauzl/issues/47
-      entry.comment = entry.fileComment;
-
-      self.readEntryCursor += buffer.length;
-      self.entriesRead += 1;
-
-      if (entry.uncompressedSize            === 0xffffffff ||
-          entry.compressedSize              === 0xffffffff ||
-          entry.relativeOffsetOfLocalHeader === 0xffffffff) {
-        // ZIP64 format
-        // find the Zip64 Extended Information Extra Field
-        var zip64EiefBuffer = null;
-        for (var i = 0; i < entry.extraFields.length; i++) {
-          var extraField = entry.extraFields[i];
-          if (extraField.id === 0x0001) {
-            zip64EiefBuffer = extraField.data;
-            break;
-          }
-        }
-        if (zip64EiefBuffer == null) {
-          return emitErrorAndAutoClose(self, new Error("expected zip64 extended information extra field"));
-        }
-        var index = 0;
-        // 0 - Original Size          8 bytes
-        if (entry.uncompressedSize === 0xffffffff) {
-          if (index + 8 > zip64EiefBuffer.length) {
-            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include uncompressed size"));
-          }
-          entry.uncompressedSize = readUInt64LE(zip64EiefBuffer, index);
-          index += 8;
-        }
-        // 8 - Compressed Size        8 bytes
-        if (entry.compressedSize === 0xffffffff) {
-          if (index + 8 > zip64EiefBuffer.length) {
-            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include compressed size"));
-          }
-          entry.compressedSize = readUInt64LE(zip64EiefBuffer, index);
-          index += 8;
-        }
-        // 16 - Relative Header Offset 8 bytes
-        if (entry.relativeOffsetOfLocalHeader === 0xffffffff) {
-          if (index + 8 > zip64EiefBuffer.length) {
-            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include relative header offset"));
-          }
-          entry.relativeOffsetOfLocalHeader = readUInt64LE(zip64EiefBuffer, index);
-          index += 8;
-        }
-        // 24 - Disk Start Number      4 bytes
-      }
-
-      // check for Info-ZIP Unicode Path Extra Field (0x7075)
-      // see https://github.com/thejoshwolfe/yauzl/issues/33
-      if (self.decodeStrings) {
-        for (var i = 0; i < entry.extraFields.length; i++) {
-          var extraField = entry.extraFields[i];
-          if (extraField.id === 0x7075) {
-            if (extraField.data.length < 6) {
-              // too short to be meaningful
-              continue;
-            }
-            // Version       1 byte      version of this extra field, currently 1
-            if (extraField.data.readUInt8(0) !== 1) {
-              // > Changes may not be backward compatible so this extra
-              // > field should not be used if the version is not recognized.
-              continue;
-            }
-            // NameCRC32     4 bytes     File Name Field CRC32 Checksum
-            var oldNameCrc32 = extraField.data.readUInt32LE(1);
-            if (crc32.unsigned(buffer.slice(0, entry.fileNameLength)) !== oldNameCrc32) {
-              // > If the CRC check fails, this UTF-8 Path Extra Field should be
-              // > ignored and the File Name field in the header should be used instead.
-              continue;
-            }
-            // UnicodeName   Variable    UTF-8 version of the entry File Name
-            entry.fileName = decodeBuffer(extraField.data, 5, extraField.data.length, true);
-            break;
-          }
-        }
-      }
-
-      // validate file size
-      if (self.validateEntrySizes && entry.compressionMethod === 0) {
-        var expectedCompressedSize = entry.uncompressedSize;
-        if (entry.isEncrypted()) {
-          // traditional encryption prefixes the file data with a header
-          expectedCompressedSize += 12;
-        }
-        if (entry.compressedSize !== expectedCompressedSize) {
-          var msg = "compressed/uncompressed size mismatch for stored file: " + entry.compressedSize + " != " + entry.uncompressedSize;
-          return emitErrorAndAutoClose(self, new Error(msg));
-        }
-      }
-
-      if (self.decodeStrings) {
-        if (!self.strictFileNames) {
-          // allow backslash
-          entry.fileName = entry.fileName.replace(/\\/g, "/");
-        }
-        var errorMessage = validateFileName(entry.fileName, self.validateFileNameOptions);
-        if (errorMessage != null) return emitErrorAndAutoClose(self, new Error(errorMessage));
-      }
-      self.emit("entry", entry);
-
-      if (!self.lazyEntries) self._readEntry();
-    });
-  });
-};
-
-ZipFile.prototype.openReadStream = function(entry, options, callback) {
-  var self = this;
-  // parameter validation
-  var relativeStart = 0;
-  var relativeEnd = entry.compressedSize;
-  if (callback == null) {
-    callback = options;
-    options = {};
-  } else {
-    // validate options that the caller has no excuse to get wrong
-    if (options.decrypt != null) {
-      if (!entry.isEncrypted()) {
-        throw new Error("options.decrypt can only be specified for encrypted entries");
-      }
-      if (options.decrypt !== false) throw new Error("invalid options.decrypt value: " + options.decrypt);
-      if (entry.isCompressed()) {
-        if (options.decompress !== false) throw new Error("entry is encrypted and compressed, and options.decompress !== false");
-      }
-    }
-    if (options.decompress != null) {
-      if (!entry.isCompressed()) {
-        throw new Error("options.decompress can only be specified for compressed entries");
-      }
-      if (!(options.decompress === false || options.decompress === true)) {
-        throw new Error("invalid options.decompress value: " + options.decompress);
-      }
-    }
-    if (options.start != null || options.end != null) {
-      if (entry.isCompressed() && options.decompress !== false) {
-        throw new Error("start/end range not allowed for compressed entry without options.decompress === false");
-      }
-      if (entry.isEncrypted() && options.decrypt !== false) {
-        throw new Error("start/end range not allowed for encrypted entry without options.decrypt === false");
-      }
-    }
-    if (options.start != null) {
-      relativeStart = options.start;
-      if (relativeStart < 0) throw new Error("options.start < 0");
-      if (relativeStart > entry.compressedSize) throw new Error("options.start > entry.compressedSize");
-    }
-    if (options.end != null) {
-      relativeEnd = options.end;
-      if (relativeEnd < 0) throw new Error("options.end < 0");
-      if (relativeEnd > entry.compressedSize) throw new Error("options.end > entry.compressedSize");
-      if (relativeEnd < relativeStart) throw new Error("options.end < options.start");
-    }
-  }
-  // any further errors can either be caused by the zipfile,
-  // or were introduced in a minor version of yauzl,
-  // so should be passed to the client rather than thrown.
-  if (!self.isOpen) return callback(new Error("closed"));
-  if (entry.isEncrypted()) {
-    if (options.decrypt !== false) return callback(new Error("entry is encrypted, and options.decrypt !== false"));
-  }
-  // make sure we don't lose the fd before we open the actual read stream
-  self.reader.ref();
-  var buffer = newBuffer(30);
-  readAndAssertNoEof(self.reader, buffer, 0, buffer.length, entry.relativeOffsetOfLocalHeader, function(err) {
-    try {
-      if (err) return callback(err);
-      // 0 - Local file header signature = 0x04034b50
-      var signature = buffer.readUInt32LE(0);
-      if (signature !== 0x04034b50) {
-        return callback(new Error("invalid local file header signature: 0x" + signature.toString(16)));
-      }
-      // all this should be redundant
-      // 4 - Version needed to extract (minimum)
-      // 6 - General purpose bit flag
-      // 8 - Compression method
-      // 10 - File last modification time
-      // 12 - File last modification date
-      // 14 - CRC-32
-      // 18 - Compressed size
-      // 22 - Uncompressed size
-      // 26 - File name length (n)
-      var fileNameLength = buffer.readUInt16LE(26);
-      // 28 - Extra field length (m)
-      var extraFieldLength = buffer.readUInt16LE(28);
-      // 30 - File name
-      // 30+n - Extra field
-      var localFileHeaderEnd = entry.relativeOffsetOfLocalHeader + buffer.length + fileNameLength + extraFieldLength;
-      var decompress;
-      if (entry.compressionMethod === 0) {
-        // 0 - The file is stored (no compression)
-        decompress = false;
-      } else if (entry.compressionMethod === 8) {
-        // 8 - The file is Deflated
-        decompress = options.decompress != null ? options.decompress : true;
-      } else {
-        return callback(new Error("unsupported compression method: " + entry.compressionMethod));
-      }
-      var fileDataStart = localFileHeaderEnd;
-      var fileDataEnd = fileDataStart + entry.compressedSize;
-      if (entry.compressedSize !== 0) {
-        // bounds check now, because the read streams will probably not complain loud enough.
-        // since we're dealing with an unsigned offset plus an unsigned size,
-        // we only have 1 thing to check for.
-        if (fileDataEnd > self.fileSize) {
-          return callback(new Error("file data overflows file bounds: " +
-              fileDataStart + " + " + entry.compressedSize + " > " + self.fileSize));
-        }
-      }
-      var readStream = self.reader.createReadStream({
-        start: fileDataStart + relativeStart,
-        end: fileDataStart + relativeEnd,
-      });
-      var endpointStream = readStream;
-      if (decompress) {
-        var destroyed = false;
-        var inflateFilter = zlib.createInflateRaw();
-        readStream.on("error", function(err) {
-          // setImmediate here because errors can be emitted during the first call to pipe()
-          setImmediate(function() {
-            if (!destroyed) inflateFilter.emit("error", err);
-          });
-        });
-        readStream.pipe(inflateFilter);
-
-        if (self.validateEntrySizes) {
-          endpointStream = new AssertByteCountStream(entry.uncompressedSize);
-          inflateFilter.on("error", function(err) {
-            // forward zlib errors to the client-visible stream
-            setImmediate(function() {
-              if (!destroyed) endpointStream.emit("error", err);
-            });
-          });
-          inflateFilter.pipe(endpointStream);
-        } else {
-          // the zlib filter is the client-visible stream
-          endpointStream = inflateFilter;
-        }
-        // this is part of yauzl's API, so implement this function on the client-visible stream
-        endpointStream.destroy = function() {
-          destroyed = true;
-          if (inflateFilter !== endpointStream) inflateFilter.unpipe(endpointStream);
-          readStream.unpipe(inflateFilter);
-          // TODO: the inflateFilter may cause a memory leak. see Issue #27.
-          readStream.destroy();
-        };
-      }
-      callback(null, endpointStream);
-    } finally {
-      self.reader.unref();
-    }
-  });
-};
-
-function Entry() {
-}
-Entry.prototype.getLastModDate = function() {
-  return dosDateTimeToDate(this.lastModFileDate, this.lastModFileTime);
-};
-Entry.prototype.isEncrypted = function() {
-  return (this.generalPurposeBitFlag & 0x1) !== 0;
-};
-Entry.prototype.isCompressed = function() {
-  return this.compressionMethod === 8;
-};
-
-function dosDateTimeToDate(date, time) {
-  var day = date & 0x1f; // 1-31
-  var month = (date >> 5 & 0xf) - 1; // 1-12, 0-11
-  var year = (date >> 9 & 0x7f) + 1980; // 0-128, 1980-2108
-
-  var millisecond = 0;
-  var second = (time & 0x1f) * 2; // 0-29, 0-58 (even numbers)
-  var minute = time >> 5 & 0x3f; // 0-59
-  var hour = time >> 11 & 0x1f; // 0-23
-
-  return new Date(year, month, day, hour, minute, second, millisecond);
-}
-
-function validateFileName(fileName) {
-  if (fileName.indexOf("\\") !== -1) {
-    return "invalid characters in fileName: " + fileName;
-  }
-  if (/^[a-zA-Z]:/.test(fileName) || /^\//.test(fileName)) {
-    return "absolute path: " + fileName;
-  }
-  if (fileName.split("/").indexOf("..") !== -1) {
-    return "invalid relative path: " + fileName;
-  }
-  // all good
-  return null;
-}
-
-function readAndAssertNoEof(reader, buffer, offset, length, position, callback) {
-  if (length === 0) {
-    // fs.read will throw an out-of-bounds error if you try to read 0 bytes from a 0 byte file
-    return setImmediate(function() { callback(null, newBuffer(0)); });
-  }
-  reader.read(buffer, offset, length, position, function(err, bytesRead) {
-    if (err) return callback(err);
-    if (bytesRead < length) {
-      return callback(new Error("unexpected EOF"));
-    }
-    callback();
-  });
-}
-
-util.inherits(AssertByteCountStream, Transform);
-function AssertByteCountStream(byteCount) {
-  Transform.call(this);
-  this.actualByteCount = 0;
-  this.expectedByteCount = byteCount;
-}
-AssertByteCountStream.prototype._transform = function(chunk, encoding, cb) {
-  this.actualByteCount += chunk.length;
-  if (this.actualByteCount > this.expectedByteCount) {
-    var msg = "too many bytes in the stream. expected " + this.expectedByteCount + ". got at least " + this.actualByteCount;
-    return cb(new Error(msg));
-  }
-  cb(null, chunk);
-};
-AssertByteCountStream.prototype._flush = function(cb) {
-  if (this.actualByteCount < this.expectedByteCount) {
-    var msg = "not enough bytes in the stream. expected " + this.expectedByteCount + ". got only " + this.actualByteCount;
-    return cb(new Error(msg));
-  }
-  cb();
-};
-
-util.inherits(RandomAccessReader, EventEmitter);
-function RandomAccessReader() {
-  EventEmitter.call(this);
-  this.refCount = 0;
-}
-RandomAccessReader.prototype.ref = function() {
-  this.refCount += 1;
-};
-RandomAccessReader.prototype.unref = function() {
-  var self = this;
-  self.refCount -= 1;
-
-  if (self.refCount > 0) return;
-  if (self.refCount < 0) throw new Error("invalid unref");
-
-  self.close(onCloseDone);
-
-  function onCloseDone(err) {
-    if (err) return self.emit('error', err);
-    self.emit('close');
-  }
-};
-RandomAccessReader.prototype.createReadStream = function(options) {
-  var start = options.start;
-  var end = options.end;
-  if (start === end) {
-    var emptyStream = new PassThrough();
-    setImmediate(function() {
-      emptyStream.end();
-    });
-    return emptyStream;
-  }
-  var stream = this._readStreamForRange(start, end);
-
-  var destroyed = false;
-  var refUnrefFilter = new RefUnrefFilter(this);
-  stream.on("error", function(err) {
-    setImmediate(function() {
-      if (!destroyed) refUnrefFilter.emit("error", err);
-    });
-  });
-  refUnrefFilter.destroy = function() {
-    stream.unpipe(refUnrefFilter);
-    refUnrefFilter.unref();
-    stream.destroy();
-  };
-
-  var byteCounter = new AssertByteCountStream(end - start);
-  refUnrefFilter.on("error", function(err) {
-    setImmediate(function() {
-      if (!destroyed) byteCounter.emit("error", err);
-    });
-  });
-  byteCounter.destroy = function() {
-    destroyed = true;
-    refUnrefFilter.unpipe(byteCounter);
-    refUnrefFilter.destroy();
-  };
-
-  return stream.pipe(refUnrefFilter).pipe(byteCounter);
-};
-RandomAccessReader.prototype._readStreamForRange = function(start, end) {
-  throw new Error("not implemented");
-};
-RandomAccessReader.prototype.read = function(buffer, offset, length, position, callback) {
-  var readStream = this.createReadStream({start: position, end: position + length});
-  var writeStream = new Writable();
-  var written = 0;
-  writeStream._write = function(chunk, encoding, cb) {
-    chunk.copy(buffer, offset + written, 0, chunk.length);
-    written += chunk.length;
-    cb();
-  };
-  writeStream.on("finish", callback);
-  readStream.on("error", function(error) {
-    callback(error);
-  });
-  readStream.pipe(writeStream);
-};
-RandomAccessReader.prototype.close = function(callback) {
-  setImmediate(callback);
-};
-
-util.inherits(RefUnrefFilter, PassThrough);
-function RefUnrefFilter(context) {
-  PassThrough.call(this);
-  this.context = context;
-  this.context.ref();
-  this.unreffedYet = false;
-}
-RefUnrefFilter.prototype._flush = function(cb) {
-  this.unref();
-  cb();
-};
-RefUnrefFilter.prototype.unref = function(cb) {
-  if (this.unreffedYet) return;
-  this.unreffedYet = true;
-  this.context.unref();
-};
-
-var cp437 = '\u0000☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼ !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
-function decodeBuffer(buffer, start, end, isUtf8) {
-  if (isUtf8) {
-    return buffer.toString("utf8", start, end);
-  } else {
-    var result = "";
-    for (var i = start; i < end; i++) {
-      result += cp437[buffer[i]];
-    }
-    return result;
-  }
-}
-
-function readUInt64LE(buffer, offset) {
-  // there is no native function for this, because we can't actually store 64-bit integers precisely.
-  // after 53 bits, JavaScript's Number type (IEEE 754 double) can't store individual integers anymore.
-  // but since 53 bits is a whole lot more than 32 bits, we do our best anyway.
-  var lower32 = buffer.readUInt32LE(offset);
-  var upper32 = buffer.readUInt32LE(offset + 4);
-  // we can't use bitshifting here, because JavaScript bitshifting only works on 32-bit integers.
-  return upper32 * 0x100000000 + lower32;
-  // as long as we're bounds checking the result of this function against the total file size,
-  // we'll catch any overflow errors, because we already made sure the total file size was within reason.
-}
-
-// Node 10 deprecated new Buffer().
-var newBuffer;
-if (typeof Buffer.allocUnsafe === "function") {
-  newBuffer = function(len) {
-    return Buffer.allocUnsafe(len);
-  };
-} else {
-  newBuffer = function(len) {
-    return new Buffer(len);
-  };
-}
-
-function defaultCallback(err) {
-  if (err) throw err;
-}
-
-
-/***/ }),
-
 /***/ 1160:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -10254,124 +9451,6 @@ module.exports = function alloc (size, fill, encoding) {
 
 /***/ }),
 
-/***/ 9776:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-var Buffer = (__nccwpck_require__(181).Buffer);
-
-var CRC_TABLE = [
-  0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419,
-  0x706af48f, 0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4,
-  0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07,
-  0x90bf1d91, 0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de,
-  0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7, 0x136c9856,
-  0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9,
-  0xfa0f3d63, 0x8d080df5, 0x3b6e20c8, 0x4c69105e, 0xd56041e4,
-  0xa2677172, 0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
-  0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940, 0x32d86ce3,
-  0x45df5c75, 0xdcd60dcf, 0xabd13d59, 0x26d930ac, 0x51de003a,
-  0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423, 0xcfba9599,
-  0xb8bda50f, 0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924,
-  0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d, 0x76dc4190,
-  0x01db7106, 0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f,
-  0x9fbfe4a5, 0xe8b8d433, 0x7807c9a2, 0x0f00f934, 0x9609a88e,
-  0xe10e9818, 0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
-  0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e, 0x6c0695ed,
-  0x1b01a57b, 0x8208f4c1, 0xf50fc457, 0x65b0d9c6, 0x12b7e950,
-  0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3,
-  0xfbd44c65, 0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2,
-  0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb, 0x4369e96a,
-  0x346ed9fc, 0xad678846, 0xda60b8d0, 0x44042d73, 0x33031de5,
-  0xaa0a4c5f, 0xdd0d7cc9, 0x5005713c, 0x270241aa, 0xbe0b1010,
-  0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
-  0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17,
-  0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad, 0xedb88320, 0x9abfb3b6,
-  0x03b6e20c, 0x74b1d29a, 0xead54739, 0x9dd277af, 0x04db2615,
-  0x73dc1683, 0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8,
-  0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1, 0xf00f9344,
-  0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb,
-  0x196c3671, 0x6e6b06e7, 0xfed41b76, 0x89d32be0, 0x10da7a5a,
-  0x67dd4acc, 0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
-  0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252, 0xd1bb67f1,
-  0xa6bc5767, 0x3fb506dd, 0x48b2364b, 0xd80d2bda, 0xaf0a1b4c,
-  0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55, 0x316e8eef,
-  0x4669be79, 0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236,
-  0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f, 0xc5ba3bbe,
-  0xb2bd0b28, 0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31,
-  0x2cd99e8b, 0x5bdeae1d, 0x9b64c2b0, 0xec63f226, 0x756aa39c,
-  0x026d930a, 0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
-  0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38, 0x92d28e9b,
-  0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21, 0x86d3d2d4, 0xf1d4e242,
-  0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1,
-  0x18b74777, 0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c,
-  0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45, 0xa00ae278,
-  0xd70dd2ee, 0x4e048354, 0x3903b3c2, 0xa7672661, 0xd06016f7,
-  0x4969474d, 0x3e6e77db, 0xaed16a4a, 0xd9d65adc, 0x40df0b66,
-  0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
-  0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605,
-  0xcdd70693, 0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8,
-  0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b,
-  0x2d02ef8d
-];
-
-if (typeof Int32Array !== 'undefined') {
-  CRC_TABLE = new Int32Array(CRC_TABLE);
-}
-
-function ensureBuffer(input) {
-  if (Buffer.isBuffer(input)) {
-    return input;
-  }
-
-  var hasNewBufferAPI =
-      typeof Buffer.alloc === "function" &&
-      typeof Buffer.from === "function";
-
-  if (typeof input === "number") {
-    return hasNewBufferAPI ? Buffer.alloc(input) : new Buffer(input);
-  }
-  else if (typeof input === "string") {
-    return hasNewBufferAPI ? Buffer.from(input) : new Buffer(input);
-  }
-  else {
-    throw new Error("input must be buffer, number, or string, received " +
-                    typeof input);
-  }
-}
-
-function bufferizeInt(num) {
-  var tmp = ensureBuffer(4);
-  tmp.writeInt32BE(num, 0);
-  return tmp;
-}
-
-function _crc32(buf, previous) {
-  buf = ensureBuffer(buf);
-  if (Buffer.isBuffer(previous)) {
-    previous = previous.readUInt32BE(0);
-  }
-  var crc = ~~previous ^ -1;
-  for (var n = 0; n < buf.length; n++) {
-    crc = CRC_TABLE[(crc ^ buf[n]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ -1);
-}
-
-function crc32() {
-  return bufferizeInt(_crc32.apply(null, arguments));
-}
-crc32.signed = function () {
-  return _crc32.apply(null, arguments);
-};
-crc32.unsigned = function () {
-  return _crc32.apply(null, arguments) >>> 0;
-};
-
-module.exports = crc32;
-
-
-/***/ }),
-
 /***/ 4764:
 /***/ ((module) => {
 
@@ -11211,9 +10290,15 @@ class TarStream extends BaseStream {
     const waitingEntry = this._waitingEntries.shift();
     if (waitingEntry) {
       this.addEntry.apply(this, waitingEntry);
-    } else {
-      this._finalize();
+      return;
     }
+    // A caller adding entries back to back queues the later ones only after this
+    // returns, and for zip the finish callback runs synchronously, so finalizing
+    // here would close the archive after the first entry. Give the caller a tick.
+    setImmediate(() => {
+      if (this._processing || this._waitingEntries.length > 0) return;
+      this._finalize();
+    });
   }
 
   _finalize() {
@@ -11469,6 +10554,33 @@ const fs = __nccwpck_require__(9896);
 const path = __nccwpck_require__(6928);
 const { pipeline: pump } = __nccwpck_require__(2203);
 
+// Matches the kernel's own symlink chain limit closely enough to reject loops
+// that realpath() never sees, without rejecting any realistic layout.
+const MAX_SYMLINK_DEPTH = 32;
+
+// Numeric flags are accepted here per the "File system flags" section of the fs
+// docs, the same way node:zip opens with O_NOFOLLOW. The flag makes open() fail
+// with ELOOP when the final component is a symlink, so the write never resolves
+// one. It is undefined on Windows, where unlinkSymlink() below does the work.
+const NO_FOLLOW_WRITE_FLAGS = typeof fs.constants.O_NOFOLLOW === 'number'
+  ? fs.constants.O_NOFOLLOW | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_WRONLY
+  : 'w';
+
+/**
+ * Remove a symlink sitting at the exact path an entry is about to be written to.
+ * Extraction replaces such a link rather than writing through to whatever it
+ * points at, which is how tar(1), node-tar and libarchive all behave.
+ * @param {string} target - Absolute path of the entry destination
+ */
+async function unlinkSymlink(target) {
+  try {
+    const stat = await fs.promises.lstat(target);
+    if (stat.isSymbolicLink()) await fs.promises.unlink(target);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+}
+
 /**
  * Check if childPath is within parentPath (prevents path traversal attacks)
  * @param {string} childPath - The path to check
@@ -11483,6 +10595,78 @@ function isPathWithinParent(childPath, parentPath) {
     : normalizedParent + path.sep;
   return normalizedChild === normalizedParent ||
          normalizedChild.startsWith(parentWithSep);
+}
+
+/**
+ * Check if the real filesystem path stays within parentDir,
+ * accounting for pre-existing symlinks on disk.
+ * Walks each path segment from parentDir to targetPath using lstat.
+ * If any segment is a symlink, resolves it and verifies it stays within parentDir.
+ * @param {string} targetPath - Absolute path to validate
+ * @param {string} parentDir - Absolute path of the extraction root
+ * @param {string} realParentDir - Pre-resolved real path of parentDir (handles OS-level symlinks like /var -> /private/var on macOS)
+ * @param {number} depth - Recursion depth when re-walking a dangling symlink's target
+ * @return {Promise<boolean>} true if safe, false if any segment escapes via symlink
+ */
+async function isRealPathSafe(targetPath, parentDir, realParentDir, depth = 0) {
+  // realpath() rejects long chains with ELOOP, but the dangling branch below resolves
+  // hop by hop without the kernel's help, so it needs its own bound.
+  if (depth >= MAX_SYMLINK_DEPTH) return false;
+
+  function isWithinParent(p) {
+    return isPathWithinParent(p, parentDir) || isPathWithinParent(p, realParentDir);
+  }
+
+  // A link target may be written in either namespace when the two differ, as with
+  // /var -> /private/var on macOS. Walk from whichever root actually contains it,
+  // or the relative path below would climb out through '..' and reject a safe link.
+  let baseDir;
+  if (isPathWithinParent(targetPath, parentDir)) {
+    baseDir = parentDir;
+  } else if (isPathWithinParent(targetPath, realParentDir)) {
+    baseDir = realParentDir;
+  } else {
+    return false;
+  }
+
+  const relative = path.relative(baseDir, targetPath);
+  const segments = relative.split(path.sep);
+  let current = baseDir;
+  for (const segment of segments) {
+    if (!segment || segment === '.') continue;
+    current = path.join(current, segment);
+    try {
+      const stat = await fs.promises.lstat(current);
+      if (stat.isSymbolicLink()) {
+        let resolved;
+        try {
+          resolved = await fs.promises.realpath(current);
+        } catch (e) {
+          if (e.code === 'ENOENT') {
+            // Dangling symlink: realpath() gave up, so resolve the textual target
+            // ourselves. Checking the target string alone is not enough, because the
+            // target may itself be a symlink, or sit under a directory that is one,
+            // and both get resolved when the entry is actually written.
+            const linkTarget = await fs.promises.readlink(current);
+            const absTarget = path.resolve(path.dirname(current), linkTarget);
+            if (!isWithinParent(absTarget)) return false;
+            return await isRealPathSafe(absTarget, parentDir, realParentDir, depth + 1);
+          }
+          // Fail closed: unexpected errors during symlink resolution are unsafe
+          return false;
+        }
+        if (!isWithinParent(resolved)) {
+          return false;
+        }
+        current = resolved;
+      }
+    } catch (e) {
+      if (e.code === 'ENOENT') break; // Path doesn't exist yet, safe
+      // Fail closed: unexpected filesystem errors are unsafe
+      return false;
+    }
+  }
+  return true;
 }
 
 // file/fileBuffer/stream
@@ -11579,6 +10763,9 @@ exports.makeUncompressFn = StreamClass => {
 
         // Resolve destDir to absolute path for security validation
         const resolvedDestDir = path.resolve(destDir);
+        // Resolve once for the entire extraction to handle OS-level symlinks
+        // (e.g. /var -> /private/var on macOS)
+        const realDestDirPromise = fs.promises.realpath(resolvedDestDir).catch(() => resolvedDestDir);
 
         let entryCount = 0;
         let successCount = 0;
@@ -11586,6 +10773,64 @@ exports.makeUncompressFn = StreamClass => {
         function done() {
           // resolve when both stream finish and file write finish
           if (isFinish && entryCount === successCount) resolve();
+        }
+
+        async function processEntry(header, stream) {
+          const destFilePath = path.join(resolvedDestDir, stripFileName(strip, header.name, header.type));
+          const resolvedDestPath = path.resolve(destFilePath);
+
+          if (!isPathWithinParent(resolvedDestPath, resolvedDestDir)) {
+            console.warn(`[compressing] Skipping entry with path traversal: "${header.name}" -> "${resolvedDestPath}"`);
+            stream.resume();
+            return;
+          }
+
+          const realDestDir = await realDestDirPromise;
+          if (!await isRealPathSafe(resolvedDestPath, resolvedDestDir, realDestDir)) {
+            console.warn(`[compressing] Skipping entry "${header.name}": a symlink in its path resolves outside the extraction directory`);
+            stream.resume();
+            return;
+          }
+
+          if (header.type === 'file') {
+            const dir = path.dirname(destFilePath);
+            await fs.promises.mkdir(dir, { recursive: true });
+            await unlinkSymlink(destFilePath);
+            entryCount++;
+            pump(stream, fs.createWriteStream(destFilePath, {
+              flags: NO_FOLLOW_WRITE_FLAGS,
+              mode: opts.mode || header.mode,
+            }), err => {
+              if (err) return reject(err);
+              successCount++;
+              done();
+            });
+          } else if (header.type === 'symlink') {
+            const dir = path.dirname(destFilePath);
+            const target = path.resolve(dir, header.linkname);
+
+            if (!isPathWithinParent(target, resolvedDestDir)) {
+              console.warn(`[compressing] Skipping symlink "${header.name}": target "${target}" escapes extraction directory`);
+              stream.resume();
+              return;
+            }
+
+            if (!await isRealPathSafe(target, resolvedDestDir, realDestDir)) {
+              console.warn(`[compressing] Skipping symlink "${header.name}": target resolves outside extraction directory via existing symlink`);
+              stream.resume();
+              return;
+            }
+
+            entryCount++;
+            await fs.promises.mkdir(dir, { recursive: true });
+            const relativeTarget = path.relative(dir, target);
+            await fs.promises.symlink(relativeTarget, destFilePath);
+            successCount++;
+            stream.resume();
+          } else { // directory
+            await fs.promises.mkdir(destFilePath, { recursive: true });
+            stream.resume();
+          }
         }
 
         new StreamClass(opts)
@@ -11596,57 +10841,7 @@ exports.makeUncompressFn = StreamClass => {
           .on('error', reject)
           .on('entry', (header, stream, next) => {
             stream.on('end', next);
-            const destFilePath = path.join(resolvedDestDir, stripFileName(strip, header.name, header.type));
-            const resolvedDestPath = path.resolve(destFilePath);
-
-            // Security: Validate that the entry path doesn't escape the destination directory
-            if (!isPathWithinParent(resolvedDestPath, resolvedDestDir)) {
-              console.warn(`[compressing] Skipping entry with path traversal: "${header.name}" -> "${resolvedDestPath}"`);
-              stream.resume();
-              return;
-            }
-
-            if (header.type === 'file') {
-              const dir = path.dirname(destFilePath);
-              fs.mkdir(dir, { recursive: true }, err => {
-                if (err) return reject(err);
-
-                entryCount++;
-                pump(stream, fs.createWriteStream(destFilePath, { mode: opts.mode || header.mode }), err => {
-                  if (err) return reject(err);
-                  successCount++;
-                  done();
-                });
-              });
-            } else if (header.type === 'symlink') {
-              const dir = path.dirname(destFilePath);
-              const target = path.resolve(dir, header.linkname);
-
-              // Security: Validate that the symlink target doesn't escape the destination directory
-              if (!isPathWithinParent(target, resolvedDestDir)) {
-                console.warn(`[compressing] Skipping symlink "${header.name}": target "${target}" escapes extraction directory`);
-                stream.resume();
-                return;
-              }
-
-              entryCount++;
-
-              fs.mkdir(dir, { recursive: true }, err => {
-                if (err) return reject(err);
-
-                const relativeTarget = path.relative(dir, target);
-                fs.symlink(relativeTarget, destFilePath, err => {
-                  if (err) return reject(err);
-                  successCount++;
-                  stream.resume();
-                });
-              });
-            } else { // directory
-              fs.mkdir(destFilePath, { recursive: true }, err => {
-                if (err) return reject(err);
-                stream.resume();
-              });
-            }
+            processEntry(header, stream).catch(reject);
           });
       });
     });
@@ -11877,7 +11072,7 @@ module.exports = ZipStream;
 // https://github.com/thejoshwolfe/yauzl#no-streaming-unzip-api
 
 const debug = (__nccwpck_require__(9023).debuglog)('compressing/zip/uncompress_stream');
-const yauzl = __nccwpck_require__(1890);
+const yauzl = __nccwpck_require__(5901);
 const stream = __nccwpck_require__(2203);
 const UncompressBaseStream = __nccwpck_require__(6622);
 const utils = __nccwpck_require__(8554);
@@ -11999,7 +11194,11 @@ class ZipUncompressStream extends UncompressBaseStream {
           const placeholder = new stream.Readable({ read() {} });
           debug('directory, header: %j', header);
           this.emit('entry', header, placeholder, next);
-          setImmediate(() => placeholder.emit('end'));
+          // Push EOF rather than emitting 'end' on a timer: a fabricated event fires
+          // whether or not the consumer has finished with the entry, so a listener
+          // that creates the directory asynchronously would see the next entry, a
+          // file inside that directory, arrive before the directory exists.
+          placeholder.push(null);
         }
       })
       .on('end', () => this._finalCallback())
@@ -13591,300 +12790,6 @@ module.exports = function (data, opts) {
         return '{' + out + '}';
     })(data);
 };
-
-
-/***/ }),
-
-/***/ 1357:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-const fs = __nccwpck_require__(9896);
-const { Readable, Writable, PassThrough } = __nccwpck_require__(2203);
-const Pend = __nccwpck_require__(3313);
-const { EventEmitter } = __nccwpck_require__(4434);
-
-class FdSlicer extends EventEmitter {
-  constructor(fd, options = {}) {
-    super();
-
-    this.fd = fd;
-    this.pend = new Pend();
-    this.pend.max = 1;
-    this.refCount = 0;
-    this.autoClose = !!options.autoClose;
-  }
-
-  read(buffer, offset, length, position, callback) {
-    this.pend.go(cb => {
-      fs.read(this.fd, buffer, offset, length, position, (err, bytesRead, buffer) => {
-        cb();
-        callback(err, bytesRead, buffer);
-      });
-    });
-  }
-
-  write(buffer, offset, length, position, callback) {
-    this.pend.go(cb => {
-      fs.write(this.fd, buffer, offset, length, position, (err, written, buffer) => {
-        cb();
-        callback(err, written, buffer);
-      });
-    });
-  }
-
-  createReadStream(options) {
-    return new ReadStream(this, options);
-  }
-
-  createWriteStream(options) {
-    return new WriteStream(this, options);
-  }
-
-  ref() {
-    this.refCount += 1;
-  }
-
-  unref() {
-    this.refCount -= 1;
-
-    if (this.refCount > 0) return;
-    if (this.refCount < 0) throw new Error("invalid unref");
-
-    if (this.autoClose) {
-      fs.close(this.fd, err => {
-        if (err) {
-          this.emit('error', err);
-        } else {
-          this.emit('close');
-        }
-      });
-    }
-  }
-}
-
-class ReadStream extends Readable {
-  constructor(context, options = {}) {
-    super(options);
-
-    this.context = context;
-    this.context.ref();
-
-    this.start = options.start || 0;
-    this.endOffset = options.end;
-    this.pos = this.start;
-    this.destroyed = false;
-  }
-
-  _read(n) {
-    if (this.destroyed) return;
-
-    let toRead = Math.min(this._readableState.highWaterMark, n);
-    if (this.endOffset != null) {
-      toRead = Math.min(toRead, this.endOffset - this.pos);
-    }
-    if (toRead <= 0) {
-      this.destroyed = true;
-      this.push(null);
-      this.context.unref();
-      return;
-    }
-    this.context.pend.go(cb => {
-      if (this.destroyed) return cb();
-      const buffer = Buffer.alloc(toRead);
-      fs.read(this.context.fd, buffer, 0, toRead, this.pos, (err, bytesRead) => {
-        if (err) {
-          this.destroy(err);
-        } else if (bytesRead === 0) {
-          this.destroyed = true;
-          this.push(null);
-          this.context.unref();
-        } else {
-          this.pos += bytesRead;
-          this.push(buffer.slice(0, bytesRead));
-        }
-        cb();
-      });
-    });
-  }
-
-  destroy(err) {
-    if (this.destroyed) return;
-    err = err || new Error("stream destroyed");
-    this.destroyed = true;
-    this.emit('error', err);
-    this.context.unref();
-  }
-}
-
-class WriteStream extends Writable {
-  constructor(context, options = {}) {
-    super(options);
-
-    this.context = context;
-    this.context.ref();
-
-    this.start = options.start || 0;
-    this.endOffset = (options.end == null) ? Infinity : +options.end;
-    this.bytesWritten = 0;
-    this.pos = this.start;
-    this.destroyed = false;
-
-    this.on('finish', this.destroy.bind(this));
-  }
-
-  _write(buffer, _encoding, callback) {
-    if (this.destroyed) return;
-
-    if (this.pos + buffer.length > this.endOffset) {
-      const err = new Error("maximum file length exceeded");
-      err.code = 'ETOOBIG';
-      this.destroy();
-      callback(err);
-      return;
-    }
-    this.context.pend.go(cb => {
-      if (this.destroyed) return cb();
-      fs.write(this.context.fd, buffer, 0, buffer.length, this.pos, (err, bytes) => {
-        if (err) {
-          this.destroy();
-          cb();
-          callback(err);
-        } else {
-          this.bytesWritten += bytes;
-          this.pos += bytes;
-          this.emit('progress');
-          cb();
-          callback();
-        }
-      });
-    });
-  }
-
-  destroy() {
-    if (this.destroyed) return;
-    this.destroyed = true;
-    this.context.unref();
-  }
-}
-
-const { MAX_SAFE_INTEGER } = Number;
-
-class BufferSlicer extends EventEmitter {
-  constructor(buffer, options) {
-    super();
-
-    options = options || {};
-    this.refCount = 0;
-    this.buffer = buffer;
-    this.maxChunkSize = options.maxChunkSize || MAX_SAFE_INTEGER;
-  }
-
-  read(buffer, offset, length, position, callback) {
-    const end = position + length;
-    const delta = end - this.buffer.length;
-    const written = (delta > 0) ? delta : length;
-    this.buffer.copy(buffer, offset, position, end);
-    setImmediate(() => {
-      callback(null, written);
-    });
-  }
-
-  write(buffer, offset, length, position, callback) {
-    buffer.copy(this.buffer, position, offset, offset + length);
-    setImmediate(() => {
-      callback(null, length, buffer);
-    });
-  }
-
-  createReadStream(options = {}) {
-    const readStream = new PassThrough(options);
-    readStream.destroyed = false;
-    readStream.start = options.start || 0;
-    readStream.endOffset = options.end;
-    // by the time this function returns, we'll be done.
-    readStream.pos = readStream.endOffset || this.buffer.length;
-
-    // respect the maxChunkSize option to slice up the chunk into smaller pieces.
-    const entireSlice = this.buffer.slice(readStream.start, readStream.pos);
-    let offset = 0;
-    while (true) {
-      const nextOffset = offset + this.maxChunkSize;
-      if (nextOffset >= entireSlice.length) {
-        // last chunk
-        if (offset < entireSlice.length) {
-          readStream.write(entireSlice.slice(offset, entireSlice.length));
-        }
-        break;
-      }
-      readStream.write(entireSlice.slice(offset, nextOffset));
-      offset = nextOffset;
-    }
-
-    readStream.end();
-    readStream.destroy = () => {
-      readStream.destroyed = true;
-    };
-    return readStream;
-  }
-
-  createWriteStream(options) {
-    const bufferSlicer = this;
-    options = options || {};
-    const writeStream = new Writable(options);
-    writeStream.start = options.start || 0;
-    writeStream.endOffset = (options.end == null) ? this.buffer.length : +options.end;
-    writeStream.bytesWritten = 0;
-    writeStream.pos = writeStream.start;
-    writeStream.destroyed = false;
-    writeStream._write = (buffer, encoding, callback) => {
-      if (writeStream.destroyed) return;
-
-      const end = writeStream.pos + buffer.length;
-      if (end > writeStream.endOffset) {
-        const err = new Error("maximum file length exceeded");
-        err.code = 'ETOOBIG';
-        writeStream.destroyed = true;
-        callback(err);
-        return;
-      }
-      buffer.copy(bufferSlicer.buffer, writeStream.pos, 0, buffer.length);
-
-      writeStream.bytesWritten += buffer.length;
-      writeStream.pos = end;
-      writeStream.emit('progress');
-      callback();
-    };
-    writeStream.destroy = () => {
-      writeStream.destroyed = true;
-    };
-    return writeStream;
-  }
-
-  ref() {
-    this.refCount += 1;
-  }
-
-  unref() {
-    this.refCount -= 1;
-
-    if (this.refCount < 0) {
-      throw new Error("invalid unref");
-    }
-  }
-}
-
-function createFromBuffer(buffer, options) {
-  return new BufferSlicer(buffer, options);
-}
-
-function createFromFd(fd, options) {
-  return new FdSlicer(fd, options);
-}
-
-exports.createFromBuffer = createFromBuffer;
-exports.createFromFd = createFromFd;
-exports.BufferSlicer = BufferSlicer;
-exports.FdSlicer = FdSlicer;
 
 
 /***/ }),
@@ -15761,560 +14666,537 @@ module.exports = {
 
 "use strict";
 
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
 // Multibyte codec. In this scheme, a character is represented by 1 or more bytes.
 // Our codec supports UTF-16 surrogates, extensions for GB18030 and unicode sequences.
 // To save memory and loading time, we read table files only when requested.
 
-exports._dbcs = DBCSCodec;
+exports._dbcs = DBCSCodec
 
-var UNASSIGNED = -1,
-    GB18030_CODE = -2,
-    SEQ_START  = -10,
-    NODE_START = -1000,
-    UNASSIGNED_NODE = new Array(0x100),
-    DEF_CHAR = -1;
+var UNASSIGNED = -1
+var GB18030_CODE = -2
+var SEQ_START = -10
+var NODE_START = -1000
+var UNASSIGNED_NODE = new Array(0x100)
+var DEF_CHAR = -1
 
-for (var i = 0; i < 0x100; i++)
-    UNASSIGNED_NODE[i] = UNASSIGNED;
-
+for (var i = 0; i < 0x100; i++) { UNASSIGNED_NODE[i] = UNASSIGNED }
 
 // Class DBCSCodec reads and initializes mapping tables.
-function DBCSCodec(codecOptions, iconv) {
-    this.encodingName = codecOptions.encodingName;
-    if (!codecOptions)
-        throw new Error("DBCS codec is called without the data.")
-    if (!codecOptions.table)
-        throw new Error("Encoding '" + this.encodingName + "' has no data.");
+function DBCSCodec (codecOptions, iconv) {
+  this.encodingName = codecOptions.encodingName
+  if (!codecOptions) { throw new Error("DBCS codec is called without the data.") }
+  if (!codecOptions.table) { throw new Error("Encoding '" + this.encodingName + "' has no data.") }
 
-    // Load tables.
-    var mappingTable = codecOptions.table();
+  // Load tables.
+  var mappingTable = codecOptions.table()
 
+  // Decode tables: MBCS -> Unicode.
 
-    // Decode tables: MBCS -> Unicode.
+  // decodeTables is a trie, encoded as an array of arrays of integers. Internal arrays are trie nodes and all have len = 256.
+  // Trie root is decodeTables[0].
+  // Values: >=  0 -> unicode character code. can be > 0xFFFF
+  //         == UNASSIGNED -> unknown/unassigned sequence.
+  //         == GB18030_CODE -> this is the end of a GB18030 4-byte sequence.
+  //         <= NODE_START -> index of the next node in our trie to process next byte.
+  //         <= SEQ_START  -> index of the start of a character code sequence, in decodeTableSeq.
+  this.decodeTables = []
+  this.decodeTables[0] = UNASSIGNED_NODE.slice(0) // Create root node.
 
-    // decodeTables is a trie, encoded as an array of arrays of integers. Internal arrays are trie nodes and all have len = 256.
-    // Trie root is decodeTables[0].
-    // Values: >=  0 -> unicode character code. can be > 0xFFFF
-    //         == UNASSIGNED -> unknown/unassigned sequence.
-    //         == GB18030_CODE -> this is the end of a GB18030 4-byte sequence.
-    //         <= NODE_START -> index of the next node in our trie to process next byte.
-    //         <= SEQ_START  -> index of the start of a character code sequence, in decodeTableSeq.
-    this.decodeTables = [];
-    this.decodeTables[0] = UNASSIGNED_NODE.slice(0); // Create root node.
+  // Sometimes a MBCS char corresponds to a sequence of unicode chars. We store them as arrays of integers here.
+  this.decodeTableSeq = []
 
-    // Sometimes a MBCS char corresponds to a sequence of unicode chars. We store them as arrays of integers here. 
-    this.decodeTableSeq = [];
+  // Actual mapping tables consist of chunks. Use them to fill up decode tables.
+  for (var i = 0; i < mappingTable.length; i++) { this._addDecodeChunk(mappingTable[i]) }
 
-    // Actual mapping tables consist of chunks. Use them to fill up decode tables.
-    for (var i = 0; i < mappingTable.length; i++)
-        this._addDecodeChunk(mappingTable[i]);
+  // Load & create GB18030 tables when needed.
+  if (typeof codecOptions.gb18030 === "function") {
+    this.gb18030 = codecOptions.gb18030() // Load GB18030 ranges.
 
-    this.defaultCharUnicode = iconv.defaultCharUnicode;
+    // Add GB18030 common decode nodes.
+    var commonThirdByteNodeIdx = this.decodeTables.length
+    this.decodeTables.push(UNASSIGNED_NODE.slice(0))
 
-    
-    // Encode tables: Unicode -> DBCS.
+    var commonFourthByteNodeIdx = this.decodeTables.length
+    this.decodeTables.push(UNASSIGNED_NODE.slice(0))
 
-    // `encodeTable` is array mapping from unicode char to encoded char. All its values are integers for performance.
-    // Because it can be sparse, it is represented as array of buckets by 256 chars each. Bucket can be null.
-    // Values: >=  0 -> it is a normal char. Write the value (if <=256 then 1 byte, if <=65536 then 2 bytes, etc.).
-    //         == UNASSIGNED -> no conversion found. Output a default char.
-    //         <= SEQ_START  -> it's an index in encodeTableSeq, see below. The character starts a sequence.
-    this.encodeTable = [];
-    
-    // `encodeTableSeq` is used when a sequence of unicode characters is encoded as a single code. We use a tree of
-    // objects where keys correspond to characters in sequence and leafs are the encoded dbcs values. A special DEF_CHAR key
-    // means end of sequence (needed when one sequence is a strict subsequence of another).
-    // Objects are kept separately from encodeTable to increase performance.
-    this.encodeTableSeq = [];
-
-    // Some chars can be decoded, but need not be encoded.
-    var skipEncodeChars = {};
-    if (codecOptions.encodeSkipVals)
-        for (var i = 0; i < codecOptions.encodeSkipVals.length; i++) {
-            var val = codecOptions.encodeSkipVals[i];
-            if (typeof val === 'number')
-                skipEncodeChars[val] = true;
-            else
-                for (var j = val.from; j <= val.to; j++)
-                    skipEncodeChars[j] = true;
+    // Fill out the tree
+    var firstByteNode = this.decodeTables[0]
+    for (var i = 0x81; i <= 0xFE; i++) {
+      var secondByteNode = this.decodeTables[NODE_START - firstByteNode[i]]
+      for (var j = 0x30; j <= 0x39; j++) {
+        if (secondByteNode[j] === UNASSIGNED) {
+          secondByteNode[j] = NODE_START - commonThirdByteNodeIdx
+        } else if (secondByteNode[j] > NODE_START) {
+          throw new Error("gb18030 decode tables conflict at byte 2")
         }
-        
-    // Use decode trie to recursively fill out encode tables.
-    this._fillEncodeTable(0, 0, skipEncodeChars);
 
-    // Add more encoding pairs when needed.
-    if (codecOptions.encodeAdd) {
-        for (var uChar in codecOptions.encodeAdd)
-            if (Object.prototype.hasOwnProperty.call(codecOptions.encodeAdd, uChar))
-                this._setEncodeChar(uChar.charCodeAt(0), codecOptions.encodeAdd[uChar]);
+        var thirdByteNode = this.decodeTables[NODE_START - secondByteNode[j]]
+        for (var k = 0x81; k <= 0xFE; k++) {
+          if (thirdByteNode[k] === UNASSIGNED) {
+            thirdByteNode[k] = NODE_START - commonFourthByteNodeIdx
+          } else if (thirdByteNode[k] === NODE_START - commonFourthByteNodeIdx) {
+            continue
+          } else if (thirdByteNode[k] > NODE_START) {
+            throw new Error("gb18030 decode tables conflict at byte 3")
+          }
+
+          var fourthByteNode = this.decodeTables[NODE_START - thirdByteNode[k]]
+          for (var l = 0x30; l <= 0x39; l++) {
+            if (fourthByteNode[l] === UNASSIGNED) { fourthByteNode[l] = GB18030_CODE }
+          }
+        }
+      }
     }
+  }
 
-    this.defCharSB  = this.encodeTable[0][iconv.defaultCharSingleByte.charCodeAt(0)];
-    if (this.defCharSB === UNASSIGNED) this.defCharSB = this.encodeTable[0]['?'];
-    if (this.defCharSB === UNASSIGNED) this.defCharSB = "?".charCodeAt(0);
+  this.defaultCharUnicode = iconv.defaultCharUnicode
 
+  // Encode tables: Unicode -> DBCS.
 
-    // Load & create GB18030 tables when needed.
-    if (typeof codecOptions.gb18030 === 'function') {
-        this.gb18030 = codecOptions.gb18030(); // Load GB18030 ranges.
+  // `encodeTable` is array mapping from unicode char to encoded char. All its values are integers for performance.
+  // Because it can be sparse, it is represented as array of buckets by 256 chars each. Bucket can be null.
+  // Values: >=  0 -> it is a normal char. Write the value (if <=256 then 1 byte, if <=65536 then 2 bytes, etc.).
+  //         == UNASSIGNED -> no conversion found. Output a default char.
+  //         <= SEQ_START  -> it's an index in encodeTableSeq, see below. The character starts a sequence.
+  this.encodeTable = []
 
-        // Add GB18030 decode tables.
-        var thirdByteNodeIdx = this.decodeTables.length;
-        var thirdByteNode = this.decodeTables[thirdByteNodeIdx] = UNASSIGNED_NODE.slice(0);
+  // `encodeTableSeq` is used when a sequence of unicode characters is encoded as a single code. We use a tree of
+  // objects where keys correspond to characters in sequence and leafs are the encoded dbcs values. A special DEF_CHAR key
+  // means end of sequence (needed when one sequence is a strict subsequence of another).
+  // Objects are kept separately from encodeTable to increase performance.
+  this.encodeTableSeq = []
 
-        var fourthByteNodeIdx = this.decodeTables.length;
-        var fourthByteNode = this.decodeTables[fourthByteNodeIdx] = UNASSIGNED_NODE.slice(0);
+  // Some chars can be decoded, but need not be encoded.
+  var skipEncodeChars = {}
+  if (codecOptions.encodeSkipVals) {
+    for (var i = 0; i < codecOptions.encodeSkipVals.length; i++) {
+      var val = codecOptions.encodeSkipVals[i]
+      if (typeof val === "number") { skipEncodeChars[val] = true } else {
+        for (var j = val.from; j <= val.to; j++) { skipEncodeChars[j] = true }
+      }
+    }
+  }
 
-        for (var i = 0x81; i <= 0xFE; i++) {
-            var secondByteNodeIdx = NODE_START - this.decodeTables[0][i];
-            var secondByteNode = this.decodeTables[secondByteNodeIdx];
-            for (var j = 0x30; j <= 0x39; j++)
-                secondByteNode[j] = NODE_START - thirdByteNodeIdx;
-        }
-        for (var i = 0x81; i <= 0xFE; i++)
-            thirdByteNode[i] = NODE_START - fourthByteNodeIdx;
-        for (var i = 0x30; i <= 0x39; i++)
-            fourthByteNode[i] = GB18030_CODE
-    }        
+  // Use decode trie to recursively fill out encode tables.
+  this._fillEncodeTable(0, 0, skipEncodeChars)
+
+  // Add more encoding pairs when needed.
+  if (codecOptions.encodeAdd) {
+    for (var uChar in codecOptions.encodeAdd) {
+      if (Object.prototype.hasOwnProperty.call(codecOptions.encodeAdd, uChar)) { this._setEncodeChar(uChar.charCodeAt(0), codecOptions.encodeAdd[uChar]) }
+    }
+  }
+
+  this.defCharSB = this.encodeTable[0][iconv.defaultCharSingleByte.charCodeAt(0)]
+  if (this.defCharSB === UNASSIGNED) this.defCharSB = this.encodeTable[0]["?"]
+  if (this.defCharSB === UNASSIGNED) this.defCharSB = "?".charCodeAt(0)
 }
 
-DBCSCodec.prototype.encoder = DBCSEncoder;
-DBCSCodec.prototype.decoder = DBCSDecoder;
+DBCSCodec.prototype.encoder = DBCSEncoder
+DBCSCodec.prototype.decoder = DBCSDecoder
 
 // Decoder helpers
-DBCSCodec.prototype._getDecodeTrieNode = function(addr) {
-    var bytes = [];
-    for (; addr > 0; addr >>= 8)
-        bytes.push(addr & 0xFF);
-    if (bytes.length == 0)
-        bytes.push(0);
+DBCSCodec.prototype._getDecodeTrieNode = function (addr) {
+  var bytes = []
+  for (; addr > 0; addr >>>= 8) { bytes.push(addr & 0xFF) }
+  if (bytes.length == 0) { bytes.push(0) }
 
-    var node = this.decodeTables[0];
-    for (var i = bytes.length-1; i > 0; i--) { // Traverse nodes deeper into the trie.
-        var val = node[bytes[i]];
+  var node = this.decodeTables[0]
+  for (var i = bytes.length - 1; i > 0; i--) { // Traverse nodes deeper into the trie.
+    var val = node[bytes[i]]
 
-        if (val == UNASSIGNED) { // Create new node.
-            node[bytes[i]] = NODE_START - this.decodeTables.length;
-            this.decodeTables.push(node = UNASSIGNED_NODE.slice(0));
-        }
-        else if (val <= NODE_START) { // Existing node.
-            node = this.decodeTables[NODE_START - val];
-        }
-        else
-            throw new Error("Overwrite byte in " + this.encodingName + ", addr: " + addr.toString(16));
-    }
-    return node;
+    if (val == UNASSIGNED) { // Create new node.
+      node[bytes[i]] = NODE_START - this.decodeTables.length
+      this.decodeTables.push(node = UNASSIGNED_NODE.slice(0))
+    } else if (val <= NODE_START) { // Existing node.
+      node = this.decodeTables[NODE_START - val]
+    } else { throw new Error("Overwrite byte in " + this.encodingName + ", addr: " + addr.toString(16)) }
+  }
+  return node
 }
 
+DBCSCodec.prototype._addDecodeChunk = function (chunk) {
+  // First element of chunk is the hex mbcs code where we start.
+  var curAddr = parseInt(chunk[0], 16)
 
-DBCSCodec.prototype._addDecodeChunk = function(chunk) {
-    // First element of chunk is the hex mbcs code where we start.
-    var curAddr = parseInt(chunk[0], 16);
+  // Choose the decoding node where we'll write our chars.
+  var writeTable = this._getDecodeTrieNode(curAddr)
+  curAddr = curAddr & 0xFF
 
-    // Choose the decoding node where we'll write our chars.
-    var writeTable = this._getDecodeTrieNode(curAddr);
-    curAddr = curAddr & 0xFF;
+  // Write all other elements of the chunk to the table.
+  for (var k = 1; k < chunk.length; k++) {
+    var part = chunk[k]
+    if (typeof part === "string") { // String, write as-is.
+      for (var l = 0; l < part.length;) {
+        var code = part.charCodeAt(l++)
+        if (code >= 0xD800 && code < 0xDC00) { // Decode surrogate
+          var codeTrail = part.charCodeAt(l++)
+          if (codeTrail >= 0xDC00 && codeTrail < 0xE000) { writeTable[curAddr++] = 0x10000 + (code - 0xD800) * 0x400 + (codeTrail - 0xDC00) } else { throw new Error("Incorrect surrogate pair in " + this.encodingName + " at chunk " + chunk[0]) }
+        } else if (code > 0x0FF0 && code <= 0x0FFF) { // Character sequence (our own encoding used)
+          var len = 0xFFF - code + 2
+          var seq = []
+          for (var m = 0; m < len; m++) { seq.push(part.charCodeAt(l++)) } // Simple variation: don't support surrogates or subsequences in seq.
 
-    // Write all other elements of the chunk to the table.
-    for (var k = 1; k < chunk.length; k++) {
-        var part = chunk[k];
-        if (typeof part === "string") { // String, write as-is.
-            for (var l = 0; l < part.length;) {
-                var code = part.charCodeAt(l++);
-                if (0xD800 <= code && code < 0xDC00) { // Decode surrogate
-                    var codeTrail = part.charCodeAt(l++);
-                    if (0xDC00 <= codeTrail && codeTrail < 0xE000)
-                        writeTable[curAddr++] = 0x10000 + (code - 0xD800) * 0x400 + (codeTrail - 0xDC00);
-                    else
-                        throw new Error("Incorrect surrogate pair in "  + this.encodingName + " at chunk " + chunk[0]);
-                }
-                else if (0x0FF0 < code && code <= 0x0FFF) { // Character sequence (our own encoding used)
-                    var len = 0xFFF - code + 2;
-                    var seq = [];
-                    for (var m = 0; m < len; m++)
-                        seq.push(part.charCodeAt(l++)); // Simple variation: don't support surrogates or subsequences in seq.
-
-                    writeTable[curAddr++] = SEQ_START - this.decodeTableSeq.length;
-                    this.decodeTableSeq.push(seq);
-                }
-                else
-                    writeTable[curAddr++] = code; // Basic char
-            }
-        } 
-        else if (typeof part === "number") { // Integer, meaning increasing sequence starting with prev character.
-            var charCode = writeTable[curAddr - 1] + 1;
-            for (var l = 0; l < part; l++)
-                writeTable[curAddr++] = charCode++;
-        }
-        else
-            throw new Error("Incorrect type '" + typeof part + "' given in "  + this.encodingName + " at chunk " + chunk[0]);
-    }
-    if (curAddr > 0xFF)
-        throw new Error("Incorrect chunk in "  + this.encodingName + " at addr " + chunk[0] + ": too long" + curAddr);
+          writeTable[curAddr++] = SEQ_START - this.decodeTableSeq.length
+          this.decodeTableSeq.push(seq)
+        } else { writeTable[curAddr++] = code } // Basic char
+      }
+    } else if (typeof part === "number") { // Integer, meaning increasing sequence starting with prev character.
+      var charCode = writeTable[curAddr - 1] + 1
+      for (var l = 0; l < part; l++) { writeTable[curAddr++] = charCode++ }
+    } else { throw new Error("Incorrect type '" + typeof part + "' given in " + this.encodingName + " at chunk " + chunk[0]) }
+  }
+  if (curAddr > 0xFF) { throw new Error("Incorrect chunk in " + this.encodingName + " at addr " + chunk[0] + ": too long" + curAddr) }
 }
 
 // Encoder helpers
-DBCSCodec.prototype._getEncodeBucket = function(uCode) {
-    var high = uCode >> 8; // This could be > 0xFF because of astral characters.
-    if (this.encodeTable[high] === undefined)
-        this.encodeTable[high] = UNASSIGNED_NODE.slice(0); // Create bucket on demand.
-    return this.encodeTable[high];
+DBCSCodec.prototype._getEncodeBucket = function (uCode) {
+  var high = uCode >> 8 // This could be > 0xFF because of astral characters.
+  if (this.encodeTable[high] === undefined) {
+    this.encodeTable[high] = UNASSIGNED_NODE.slice(0)
+  } // Create bucket on demand.
+  return this.encodeTable[high]
 }
 
-DBCSCodec.prototype._setEncodeChar = function(uCode, dbcsCode) {
-    var bucket = this._getEncodeBucket(uCode);
-    var low = uCode & 0xFF;
-    if (bucket[low] <= SEQ_START)
-        this.encodeTableSeq[SEQ_START-bucket[low]][DEF_CHAR] = dbcsCode; // There's already a sequence, set a single-char subsequence of it.
-    else if (bucket[low] == UNASSIGNED)
-        bucket[low] = dbcsCode;
+DBCSCodec.prototype._setEncodeChar = function (uCode, dbcsCode) {
+  var bucket = this._getEncodeBucket(uCode)
+  var low = uCode & 0xFF
+  if (bucket[low] <= SEQ_START) { this.encodeTableSeq[SEQ_START - bucket[low]][DEF_CHAR] = dbcsCode } // There's already a sequence, set a single-char subsequence of it.
+  else if (bucket[low] == UNASSIGNED) { bucket[low] = dbcsCode }
 }
 
-DBCSCodec.prototype._setEncodeSequence = function(seq, dbcsCode) {
-    
-    // Get the root of character tree according to first character of the sequence.
-    var uCode = seq[0];
-    var bucket = this._getEncodeBucket(uCode);
-    var low = uCode & 0xFF;
+DBCSCodec.prototype._setEncodeSequence = function (seq, dbcsCode) {
+  // Get the root of character tree according to first character of the sequence.
+  var uCode = seq[0]
+  var bucket = this._getEncodeBucket(uCode)
+  var low = uCode & 0xFF
 
-    var node;
-    if (bucket[low] <= SEQ_START) {
-        // There's already a sequence with  - use it.
-        node = this.encodeTableSeq[SEQ_START-bucket[low]];
-    }
-    else {
-        // There was no sequence object - allocate a new one.
-        node = {};
-        if (bucket[low] !== UNASSIGNED) node[DEF_CHAR] = bucket[low]; // If a char was set before - make it a single-char subsequence.
-        bucket[low] = SEQ_START - this.encodeTableSeq.length;
-        this.encodeTableSeq.push(node);
-    }
+  var node
+  if (bucket[low] <= SEQ_START) {
+    // There's already a sequence with  - use it.
+    node = this.encodeTableSeq[SEQ_START - bucket[low]]
+  } else {
+    // There was no sequence object - allocate a new one.
+    node = {}
+    if (bucket[low] !== UNASSIGNED) node[DEF_CHAR] = bucket[low] // If a char was set before - make it a single-char subsequence.
+    bucket[low] = SEQ_START - this.encodeTableSeq.length
+    this.encodeTableSeq.push(node)
+  }
 
-    // Traverse the character tree, allocating new nodes as needed.
-    for (var j = 1; j < seq.length-1; j++) {
-        var oldVal = node[uCode];
-        if (typeof oldVal === 'object')
-            node = oldVal;
-        else {
-            node = node[uCode] = {}
-            if (oldVal !== undefined)
-                node[DEF_CHAR] = oldVal
-        }
+  // Traverse the character tree, allocating new nodes as needed.
+  for (var j = 1; j < seq.length - 1; j++) {
+    var oldVal = node[uCode]
+    if (typeof oldVal === "object") { node = oldVal } else {
+      node = node[uCode] = {}
+      if (oldVal !== undefined) { node[DEF_CHAR] = oldVal }
     }
+  }
 
-    // Set the leaf to given dbcsCode.
-    uCode = seq[seq.length-1];
-    node[uCode] = dbcsCode;
+  // Set the leaf to given dbcsCode.
+  uCode = seq[seq.length - 1]
+  node[uCode] = dbcsCode
 }
 
-DBCSCodec.prototype._fillEncodeTable = function(nodeIdx, prefix, skipEncodeChars) {
-    var node = this.decodeTables[nodeIdx];
-    for (var i = 0; i < 0x100; i++) {
-        var uCode = node[i];
-        var mbCode = prefix + i;
-        if (skipEncodeChars[mbCode])
-            continue;
+DBCSCodec.prototype._fillEncodeTable = function (nodeIdx, prefix, skipEncodeChars) {
+  var node = this.decodeTables[nodeIdx]
+  var hasValues = false
+  var subNodeEmpty = {}
+  for (var i = 0; i < 0x100; i++) {
+    var uCode = node[i]
+    var mbCode = prefix + i
+    if (skipEncodeChars[mbCode]) { continue }
 
-        if (uCode >= 0)
-            this._setEncodeChar(uCode, mbCode);
-        else if (uCode <= NODE_START)
-            this._fillEncodeTable(NODE_START - uCode, mbCode << 8, skipEncodeChars);
-        else if (uCode <= SEQ_START)
-            this._setEncodeSequence(this.decodeTableSeq[SEQ_START - uCode], mbCode);
+    if (uCode >= 0) {
+      this._setEncodeChar(uCode, mbCode)
+      hasValues = true
+    } else if (uCode <= NODE_START) {
+      var subNodeIdx = NODE_START - uCode
+      if (!subNodeEmpty[subNodeIdx]) {  // Skip empty subtrees (they are too large in gb18030).
+        var newPrefix = (mbCode << 8) >>> 0  // NOTE: '>>> 0' keeps 32-bit num positive.
+        if (this._fillEncodeTable(subNodeIdx, newPrefix, skipEncodeChars)) { hasValues = true } else { subNodeEmpty[subNodeIdx] = true }
+      }
+    } else if (uCode <= SEQ_START) {
+      this._setEncodeSequence(this.decodeTableSeq[SEQ_START - uCode], mbCode)
+      hasValues = true
     }
+  }
+  return hasValues
 }
-
-
 
 // == Encoder ==================================================================
 
-function DBCSEncoder(options, codec) {
-    // Encoder state
-    this.leadSurrogate = -1;
-    this.seqObj = undefined;
-    
-    // Static data
-    this.encodeTable = codec.encodeTable;
-    this.encodeTableSeq = codec.encodeTableSeq;
-    this.defaultCharSingleByte = codec.defCharSB;
-    this.gb18030 = codec.gb18030;
+function DBCSEncoder (options, codec) {
+  // Encoder state
+  this.leadSurrogate = -1
+  this.seqObj = undefined
+
+  // Static data
+  this.encodeTable = codec.encodeTable
+  this.encodeTableSeq = codec.encodeTableSeq
+  this.defaultCharSingleByte = codec.defCharSB
+  this.gb18030 = codec.gb18030
 }
 
-DBCSEncoder.prototype.write = function(str) {
-    var newBuf = Buffer.alloc(str.length * (this.gb18030 ? 4 : 3)),
-        leadSurrogate = this.leadSurrogate,
-        seqObj = this.seqObj, nextChar = -1,
-        i = 0, j = 0;
+DBCSEncoder.prototype.write = function (str) {
+  var newBuf = Buffer.alloc(str.length * (this.gb18030 ? 4 : 3))
+  var leadSurrogate = this.leadSurrogate
+  var seqObj = this.seqObj
+  var nextChar = -1
+  var i = 0; var j = 0
 
-    while (true) {
-        // 0. Get next character.
-        if (nextChar === -1) {
-            if (i == str.length) break;
-            var uCode = str.charCodeAt(i++);
-        }
-        else {
-            var uCode = nextChar;
-            nextChar = -1;    
-        }
-
-        // 1. Handle surrogates.
-        if (0xD800 <= uCode && uCode < 0xE000) { // Char is one of surrogates.
-            if (uCode < 0xDC00) { // We've got lead surrogate.
-                if (leadSurrogate === -1) {
-                    leadSurrogate = uCode;
-                    continue;
-                } else {
-                    leadSurrogate = uCode;
-                    // Double lead surrogate found.
-                    uCode = UNASSIGNED;
-                }
-            } else { // We've got trail surrogate.
-                if (leadSurrogate !== -1) {
-                    uCode = 0x10000 + (leadSurrogate - 0xD800) * 0x400 + (uCode - 0xDC00);
-                    leadSurrogate = -1;
-                } else {
-                    // Incomplete surrogate pair - only trail surrogate found.
-                    uCode = UNASSIGNED;
-                }
-                
-            }
-        }
-        else if (leadSurrogate !== -1) {
-            // Incomplete surrogate pair - only lead surrogate found.
-            nextChar = uCode; uCode = UNASSIGNED; // Write an error, then current char.
-            leadSurrogate = -1;
-        }
-
-        // 2. Convert uCode character.
-        var dbcsCode = UNASSIGNED;
-        if (seqObj !== undefined && uCode != UNASSIGNED) { // We are in the middle of the sequence
-            var resCode = seqObj[uCode];
-            if (typeof resCode === 'object') { // Sequence continues.
-                seqObj = resCode;
-                continue;
-
-            } else if (typeof resCode == 'number') { // Sequence finished. Write it.
-                dbcsCode = resCode;
-
-            } else if (resCode == undefined) { // Current character is not part of the sequence.
-
-                // Try default character for this sequence
-                resCode = seqObj[DEF_CHAR];
-                if (resCode !== undefined) {
-                    dbcsCode = resCode; // Found. Write it.
-                    nextChar = uCode; // Current character will be written too in the next iteration.
-
-                } else {
-                    // TODO: What if we have no default? (resCode == undefined)
-                    // Then, we should write first char of the sequence as-is and try the rest recursively.
-                    // Didn't do it for now because no encoding has this situation yet.
-                    // Currently, just skip the sequence and write current char.
-                }
-            }
-            seqObj = undefined;
-        }
-        else if (uCode >= 0) {  // Regular character
-            var subtable = this.encodeTable[uCode >> 8];
-            if (subtable !== undefined)
-                dbcsCode = subtable[uCode & 0xFF];
-            
-            if (dbcsCode <= SEQ_START) { // Sequence start
-                seqObj = this.encodeTableSeq[SEQ_START-dbcsCode];
-                continue;
-            }
-
-            if (dbcsCode == UNASSIGNED && this.gb18030) {
-                // Use GB18030 algorithm to find character(s) to write.
-                var idx = findIdx(this.gb18030.uChars, uCode);
-                if (idx != -1) {
-                    var dbcsCode = this.gb18030.gbChars[idx] + (uCode - this.gb18030.uChars[idx]);
-                    newBuf[j++] = 0x81 + Math.floor(dbcsCode / 12600); dbcsCode = dbcsCode % 12600;
-                    newBuf[j++] = 0x30 + Math.floor(dbcsCode / 1260); dbcsCode = dbcsCode % 1260;
-                    newBuf[j++] = 0x81 + Math.floor(dbcsCode / 10); dbcsCode = dbcsCode % 10;
-                    newBuf[j++] = 0x30 + dbcsCode;
-                    continue;
-                }
-            }
-        }
-
-        // 3. Write dbcsCode character.
-        if (dbcsCode === UNASSIGNED)
-            dbcsCode = this.defaultCharSingleByte;
-        
-        if (dbcsCode < 0x100) {
-            newBuf[j++] = dbcsCode;
-        }
-        else if (dbcsCode < 0x10000) {
-            newBuf[j++] = dbcsCode >> 8;   // high byte
-            newBuf[j++] = dbcsCode & 0xFF; // low byte
-        }
-        else {
-            newBuf[j++] = dbcsCode >> 16;
-            newBuf[j++] = (dbcsCode >> 8) & 0xFF;
-            newBuf[j++] = dbcsCode & 0xFF;
-        }
+  while (true) {
+    // 0. Get next character.
+    if (nextChar === -1) {
+      if (i == str.length) break
+      var uCode = str.charCodeAt(i++)
+    } else {
+      var uCode = nextChar
+      nextChar = -1
     }
 
-    this.seqObj = seqObj;
-    this.leadSurrogate = leadSurrogate;
-    return newBuf.slice(0, j);
-}
-
-DBCSEncoder.prototype.end = function() {
-    if (this.leadSurrogate === -1 && this.seqObj === undefined)
-        return; // All clean. Most often case.
-
-    var newBuf = Buffer.alloc(10), j = 0;
-
-    if (this.seqObj) { // We're in the sequence.
-        var dbcsCode = this.seqObj[DEF_CHAR];
-        if (dbcsCode !== undefined) { // Write beginning of the sequence.
-            if (dbcsCode < 0x100) {
-                newBuf[j++] = dbcsCode;
-            }
-            else {
-                newBuf[j++] = dbcsCode >> 8;   // high byte
-                newBuf[j++] = dbcsCode & 0xFF; // low byte
-            }
+    // 1. Handle surrogates.
+    if (uCode >= 0xD800 && uCode < 0xE000) { // Char is one of surrogates.
+      if (uCode < 0xDC00) { // We've got lead surrogate.
+        if (leadSurrogate === -1) {
+          leadSurrogate = uCode
+          continue
         } else {
-            // See todo above.
+          leadSurrogate = uCode
+          // Double lead surrogate found.
+          uCode = UNASSIGNED
         }
-        this.seqObj = undefined;
+      } else { // We've got trail surrogate.
+        if (leadSurrogate !== -1) {
+          uCode = 0x10000 + (leadSurrogate - 0xD800) * 0x400 + (uCode - 0xDC00)
+          leadSurrogate = -1
+        } else {
+          // Incomplete surrogate pair - only trail surrogate found.
+          uCode = UNASSIGNED
+        }
+      }
+    } else if (leadSurrogate !== -1) {
+      // Incomplete surrogate pair - only lead surrogate found.
+      nextChar = uCode; uCode = UNASSIGNED // Write an error, then current char.
+      leadSurrogate = -1
     }
 
-    if (this.leadSurrogate !== -1) {
-        // Incomplete surrogate pair - only lead surrogate found.
-        newBuf[j++] = this.defaultCharSingleByte;
-        this.leadSurrogate = -1;
+    // 2. Convert uCode character.
+    var dbcsCode = UNASSIGNED
+    if (seqObj !== undefined && uCode != UNASSIGNED) { // We are in the middle of the sequence
+      var resCode = seqObj[uCode]
+      if (typeof resCode === "object") { // Sequence continues.
+        seqObj = resCode
+        continue
+      } else if (typeof resCode === "number") { // Sequence finished. Write it.
+        dbcsCode = resCode
+      } else if (resCode == undefined) { // Current character is not part of the sequence.
+        // Try default character for this sequence
+        resCode = seqObj[DEF_CHAR]
+        if (resCode !== undefined) {
+          dbcsCode = resCode // Found. Write it.
+          nextChar = uCode // Current character will be written too in the next iteration.
+        } else {
+          // TODO: What if we have no default? (resCode == undefined)
+          // Then, we should write first char of the sequence as-is and try the rest recursively.
+          // Didn't do it for now because no encoding has this situation yet.
+          // Currently, just skip the sequence and write current char.
+        }
+      }
+      seqObj = undefined
+    } else if (uCode >= 0) {  // Regular character
+      var subtable = this.encodeTable[uCode >> 8]
+      if (subtable !== undefined) { dbcsCode = subtable[uCode & 0xFF] }
+
+      if (dbcsCode <= SEQ_START) { // Sequence start
+        seqObj = this.encodeTableSeq[SEQ_START - dbcsCode]
+        continue
+      }
+
+      if (dbcsCode == UNASSIGNED && this.gb18030) {
+        // Use GB18030 algorithm to find character(s) to write.
+        var idx = findIdx(this.gb18030.uChars, uCode)
+        if (idx != -1) {
+          var dbcsCode = this.gb18030.gbChars[idx] + (uCode - this.gb18030.uChars[idx])
+          newBuf[j++] = 0x81 + Math.floor(dbcsCode / 12600); dbcsCode = dbcsCode % 12600
+          newBuf[j++] = 0x30 + Math.floor(dbcsCode / 1260); dbcsCode = dbcsCode % 1260
+          newBuf[j++] = 0x81 + Math.floor(dbcsCode / 10); dbcsCode = dbcsCode % 10
+          newBuf[j++] = 0x30 + dbcsCode
+          continue
+        }
+      }
     }
-    
-    return newBuf.slice(0, j);
+
+    // 3. Write dbcsCode character.
+    if (dbcsCode === UNASSIGNED) { dbcsCode = this.defaultCharSingleByte }
+
+    if (dbcsCode < 0x100) {
+      newBuf[j++] = dbcsCode
+    } else if (dbcsCode < 0x10000) {
+      newBuf[j++] = dbcsCode >> 8   // high byte
+      newBuf[j++] = dbcsCode & 0xFF // low byte
+    } else if (dbcsCode < 0x1000000) {
+      newBuf[j++] = dbcsCode >> 16
+      newBuf[j++] = (dbcsCode >> 8) & 0xFF
+      newBuf[j++] = dbcsCode & 0xFF
+    } else {
+      newBuf[j++] = dbcsCode >>> 24
+      newBuf[j++] = (dbcsCode >>> 16) & 0xFF
+      newBuf[j++] = (dbcsCode >>> 8) & 0xFF
+      newBuf[j++] = dbcsCode & 0xFF
+    }
+  }
+
+  this.seqObj = seqObj
+  this.leadSurrogate = leadSurrogate
+  return newBuf.slice(0, j)
+}
+
+DBCSEncoder.prototype.end = function () {
+  if (this.leadSurrogate === -1 && this.seqObj === undefined) { return } // All clean. Most often case.
+
+  var newBuf = Buffer.alloc(10); var j = 0
+
+  if (this.seqObj) { // We're in the sequence.
+    var dbcsCode = this.seqObj[DEF_CHAR]
+    if (dbcsCode !== undefined) { // Write beginning of the sequence.
+      if (dbcsCode < 0x100) {
+        newBuf[j++] = dbcsCode
+      } else {
+        newBuf[j++] = dbcsCode >> 8   // high byte
+        newBuf[j++] = dbcsCode & 0xFF // low byte
+      }
+    } else {
+      // See todo above.
+    }
+    this.seqObj = undefined
+  }
+
+  if (this.leadSurrogate !== -1) {
+    // Incomplete surrogate pair - only lead surrogate found.
+    newBuf[j++] = this.defaultCharSingleByte
+    this.leadSurrogate = -1
+  }
+
+  return newBuf.slice(0, j)
 }
 
 // Export for testing
-DBCSEncoder.prototype.findIdx = findIdx;
-
+DBCSEncoder.prototype.findIdx = findIdx
 
 // == Decoder ==================================================================
 
-function DBCSDecoder(options, codec) {
-    // Decoder state
-    this.nodeIdx = 0;
-    this.prevBuf = Buffer.alloc(0);
+function DBCSDecoder (options, codec) {
+  // Decoder state
+  this.nodeIdx = 0
+  this.prevBytes = []
 
-    // Static data
-    this.decodeTables = codec.decodeTables;
-    this.decodeTableSeq = codec.decodeTableSeq;
-    this.defaultCharUnicode = codec.defaultCharUnicode;
-    this.gb18030 = codec.gb18030;
+  // Static data
+  this.decodeTables = codec.decodeTables
+  this.decodeTableSeq = codec.decodeTableSeq
+  this.defaultCharUnicode = codec.defaultCharUnicode
+  this.gb18030 = codec.gb18030
 }
 
-DBCSDecoder.prototype.write = function(buf) {
-    var newBuf = Buffer.alloc(buf.length*2),
-        nodeIdx = this.nodeIdx, 
-        prevBuf = this.prevBuf, prevBufOffset = this.prevBuf.length,
-        seqStart = -this.prevBuf.length, // idx of the start of current parsed sequence.
-        uCode;
+DBCSDecoder.prototype.write = function (buf) {
+  var newBuf = Buffer.alloc(buf.length * 2)
+  var nodeIdx = this.nodeIdx
+  var prevBytes = this.prevBytes; var prevOffset = this.prevBytes.length
+  var seqStart = -this.prevBytes.length // idx of the start of current parsed sequence.
+  var uCode
 
-    if (prevBufOffset > 0) // Make prev buf overlap a little to make it easier to slice later.
-        prevBuf = Buffer.concat([prevBuf, buf.slice(0, 10)]);
-    
-    for (var i = 0, j = 0; i < buf.length; i++) {
-        var curByte = (i >= 0) ? buf[i] : prevBuf[i + prevBufOffset];
+  for (var i = 0, j = 0; i < buf.length; i++) {
+    var curByte = (i >= 0) ? buf[i] : prevBytes[i + prevOffset]
 
-        // Lookup in current trie node.
-        var uCode = this.decodeTables[nodeIdx][curByte];
+    // Lookup in current trie node.
+    var uCode = this.decodeTables[nodeIdx][curByte]
 
-        if (uCode >= 0) { 
-            // Normal character, just use it.
-        }
-        else if (uCode === UNASSIGNED) { // Unknown char.
-            // TODO: Callback with seq.
-            //var curSeq = (seqStart >= 0) ? buf.slice(seqStart, i+1) : prevBuf.slice(seqStart + prevBufOffset, i+1 + prevBufOffset);
-            i = seqStart; // Try to parse again, after skipping first byte of the sequence ('i' will be incremented by 'for' cycle).
-            uCode = this.defaultCharUnicode.charCodeAt(0);
-        }
-        else if (uCode === GB18030_CODE) {
-            var curSeq = (seqStart >= 0) ? buf.slice(seqStart, i+1) : prevBuf.slice(seqStart + prevBufOffset, i+1 + prevBufOffset);
-            var ptr = (curSeq[0]-0x81)*12600 + (curSeq[1]-0x30)*1260 + (curSeq[2]-0x81)*10 + (curSeq[3]-0x30);
-            var idx = findIdx(this.gb18030.gbChars, ptr);
-            uCode = this.gb18030.uChars[idx] + ptr - this.gb18030.gbChars[idx];
-        }
-        else if (uCode <= NODE_START) { // Go to next trie node.
-            nodeIdx = NODE_START - uCode;
-            continue;
-        }
-        else if (uCode <= SEQ_START) { // Output a sequence of chars.
-            var seq = this.decodeTableSeq[SEQ_START - uCode];
-            for (var k = 0; k < seq.length - 1; k++) {
-                uCode = seq[k];
-                newBuf[j++] = uCode & 0xFF;
-                newBuf[j++] = uCode >> 8;
-            }
-            uCode = seq[seq.length-1];
-        }
-        else
-            throw new Error("iconv-lite internal error: invalid decoding table value " + uCode + " at " + nodeIdx + "/" + curByte);
+    if (uCode >= 0) {
+      // Normal character, just use it.
+    } else if (uCode === UNASSIGNED) { // Unknown char.
+      // TODO: Callback with seq.
+      uCode = this.defaultCharUnicode.charCodeAt(0)
+      i = seqStart // Skip one byte ('i' will be incremented by the for loop) and try to parse again.
+    } else if (uCode === GB18030_CODE) {
+      if (i >= 3) {
+        var ptr = (buf[i - 3] - 0x81) * 12600 + (buf[i - 2] - 0x30) * 1260 + (buf[i - 1] - 0x81) * 10 + (curByte - 0x30)
+      } else {
+        var ptr = (prevBytes[i - 3 + prevOffset] - 0x81) * 12600 +
+                          (((i - 2 >= 0) ? buf[i - 2] : prevBytes[i - 2 + prevOffset]) - 0x30) * 1260 +
+                          (((i - 1 >= 0) ? buf[i - 1] : prevBytes[i - 1 + prevOffset]) - 0x81) * 10 +
+                          (curByte - 0x30)
+      }
+      var idx = findIdx(this.gb18030.gbChars, ptr)
+      uCode = this.gb18030.uChars[idx] + ptr - this.gb18030.gbChars[idx]
+    } else if (uCode <= NODE_START) { // Go to next trie node.
+      nodeIdx = NODE_START - uCode
+      continue
+    } else if (uCode <= SEQ_START) { // Output a sequence of chars.
+      var seq = this.decodeTableSeq[SEQ_START - uCode]
+      for (var k = 0; k < seq.length - 1; k++) {
+        uCode = seq[k]
+        newBuf[j++] = uCode & 0xFF
+        newBuf[j++] = uCode >> 8
+      }
+      uCode = seq[seq.length - 1]
+    } else { throw new Error("iconv-lite internal error: invalid decoding table value " + uCode + " at " + nodeIdx + "/" + curByte) }
 
-        // Write the character to buffer, handling higher planes using surrogate pair.
-        if (uCode > 0xFFFF) { 
-            uCode -= 0x10000;
-            var uCodeLead = 0xD800 + Math.floor(uCode / 0x400);
-            newBuf[j++] = uCodeLead & 0xFF;
-            newBuf[j++] = uCodeLead >> 8;
+    // Write the character to buffer, handling higher planes using surrogate pair.
+    if (uCode >= 0x10000) {
+      uCode -= 0x10000
+      var uCodeLead = 0xD800 | (uCode >> 10)
+      newBuf[j++] = uCodeLead & 0xFF
+      newBuf[j++] = uCodeLead >> 8
 
-            uCode = 0xDC00 + uCode % 0x400;
-        }
-        newBuf[j++] = uCode & 0xFF;
-        newBuf[j++] = uCode >> 8;
-
-        // Reset trie node.
-        nodeIdx = 0; seqStart = i+1;
+      uCode = 0xDC00 | (uCode & 0x3FF)
     }
+    newBuf[j++] = uCode & 0xFF
+    newBuf[j++] = uCode >> 8
 
-    this.nodeIdx = nodeIdx;
-    this.prevBuf = (seqStart >= 0) ? buf.slice(seqStart) : prevBuf.slice(seqStart + prevBufOffset);
-    return newBuf.slice(0, j).toString('ucs2');
+    // Reset trie node.
+    nodeIdx = 0; seqStart = i + 1
+  }
+
+  this.nodeIdx = nodeIdx
+  this.prevBytes = (seqStart >= 0)
+    ? Array.prototype.slice.call(buf, seqStart)
+    : prevBytes.slice(seqStart + prevOffset).concat(Array.prototype.slice.call(buf))
+
+  return newBuf.slice(0, j).toString("ucs2")
 }
 
-DBCSDecoder.prototype.end = function() {
-    var ret = '';
+DBCSDecoder.prototype.end = function () {
+  var ret = ""
 
-    // Try to parse all remaining chars.
-    while (this.prevBuf.length > 0) {
-        // Skip 1 character in the buffer.
-        ret += this.defaultCharUnicode;
-        var buf = this.prevBuf.slice(1);
+  // Try to parse all remaining chars.
+  while (this.prevBytes.length > 0) {
+    // Skip 1 character in the buffer.
+    ret += this.defaultCharUnicode
+    var bytesArr = this.prevBytes.slice(1)
 
-        // Parse remaining as usual.
-        this.prevBuf = Buffer.alloc(0);
-        this.nodeIdx = 0;
-        if (buf.length > 0)
-            ret += this.write(buf);
-    }
+    // Parse remaining as usual.
+    this.prevBytes = []
+    this.nodeIdx = 0
+    if (bytesArr.length > 0) { ret += this.write(bytesArr) }
+  }
 
-    this.nodeIdx = 0;
-    return ret;
+  this.prevBytes = []
+  this.nodeIdx = 0
+  return ret
 }
 
 // Binary search for GB18030. Returns largest i such that table[i] <= val.
-function findIdx(table, val) {
-    if (table[0] > val)
-        return -1;
+function findIdx (table, val) {
+  if (table[0] > val) { return -1 }
 
-    var l = 0, r = table.length;
-    while (l < r-1) { // always table[l] <= val < table[r]
-        var mid = l + Math.floor((r-l+1)/2);
-        if (table[mid] <= val)
-            l = mid;
-        else
-            r = mid;
-    }
-    return l;
+  var l = 0; var r = table.length
+  while (l < r - 1) { // always table[l] <= val < table[r]
+    var mid = l + ((r - l + 1) >> 1)
+    if (table[mid] <= val) { l = mid } else { r = mid }
+  }
+  return l
 }
-
 
 
 /***/ }),
@@ -16330,175 +15212,184 @@ function findIdx(table, val) {
 // require()-s are direct to support Browserify.
 
 module.exports = {
-    
-    // == Japanese/ShiftJIS ====================================================
-    // All japanese encodings are based on JIS X set of standards:
-    // JIS X 0201 - Single-byte encoding of ASCII + ¥ + Kana chars at 0xA1-0xDF.
-    // JIS X 0208 - Main set of 6879 characters, placed in 94x94 plane, to be encoded by 2 bytes. 
-    //              Has several variations in 1978, 1983, 1990 and 1997.
-    // JIS X 0212 - Supplementary plane of 6067 chars in 94x94 plane. 1990. Effectively dead.
-    // JIS X 0213 - Extension and modern replacement of 0208 and 0212. Total chars: 11233.
-    //              2 planes, first is superset of 0208, second - revised 0212.
-    //              Introduced in 2000, revised 2004. Some characters are in Unicode Plane 2 (0x2xxxx)
 
-    // Byte encodings are:
-    //  * Shift_JIS: Compatible with 0201, uses not defined chars in top half as lead bytes for double-byte
-    //               encoding of 0208. Lead byte ranges: 0x81-0x9F, 0xE0-0xEF; Trail byte ranges: 0x40-0x7E, 0x80-0x9E, 0x9F-0xFC.
-    //               Windows CP932 is a superset of Shift_JIS. Some companies added more chars, notably KDDI.
-    //  * EUC-JP:    Up to 3 bytes per character. Used mostly on *nixes.
-    //               0x00-0x7F       - lower part of 0201
-    //               0x8E, 0xA1-0xDF - upper part of 0201
-    //               (0xA1-0xFE)x2   - 0208 plane (94x94).
-    //               0x8F, (0xA1-0xFE)x2 - 0212 plane (94x94).
-    //  * JIS X 208: 7-bit, direct encoding of 0208. Byte ranges: 0x21-0x7E (94 values). Uncommon.
-    //               Used as-is in ISO2022 family.
-    //  * ISO2022-JP: Stateful encoding, with escape sequences to switch between ASCII, 
-    //                0201-1976 Roman, 0208-1978, 0208-1983.
-    //  * ISO2022-JP-1: Adds esc seq for 0212-1990.
-    //  * ISO2022-JP-2: Adds esc seq for GB2313-1980, KSX1001-1992, ISO8859-1, ISO8859-7.
-    //  * ISO2022-JP-3: Adds esc seq for 0201-1976 Kana set, 0213-2000 Planes 1, 2.
-    //  * ISO2022-JP-2004: Adds 0213-2004 Plane 1.
-    //
-    // After JIS X 0213 appeared, Shift_JIS-2004, EUC-JISX0213 and ISO2022-JP-2004 followed, with just changing the planes.
-    //
-    // Overall, it seems that it's a mess :( http://www8.plala.or.jp/tkubota1/unicode-symbols-map2.html
+  // == Japanese/ShiftJIS ====================================================
+  // All japanese encodings are based on JIS X set of standards:
+  // JIS X 0201 - Single-byte encoding of ASCII + ¥ + Kana chars at 0xA1-0xDF.
+  // JIS X 0208 - Main set of 6879 characters, placed in 94x94 plane, to be encoded by 2 bytes.
+  //              Has several variations in 1978, 1983, 1990 and 1997.
+  // JIS X 0212 - Supplementary plane of 6067 chars in 94x94 plane. 1990. Effectively dead.
+  // JIS X 0213 - Extension and modern replacement of 0208 and 0212. Total chars: 11233.
+  //              2 planes, first is superset of 0208, second - revised 0212.
+  //              Introduced in 2000, revised 2004. Some characters are in Unicode Plane 2 (0x2xxxx)
 
-    'shiftjis': {
-        type: '_dbcs',
-        table: function() { return __nccwpck_require__(679) },
-        encodeAdd: {'\u00a5': 0x5C, '\u203E': 0x7E},
-        encodeSkipVals: [{from: 0xED40, to: 0xF940}],
-    },
-    'csshiftjis': 'shiftjis',
-    'mskanji': 'shiftjis',
-    'sjis': 'shiftjis',
-    'windows31j': 'shiftjis',
-    'ms31j': 'shiftjis',
-    'xsjis': 'shiftjis',
-    'windows932': 'shiftjis',
-    'ms932': 'shiftjis',
-    '932': 'shiftjis',
-    'cp932': 'shiftjis',
+  // Byte encodings are:
+  //  * Shift_JIS: Compatible with 0201, uses not defined chars in top half as lead bytes for double-byte
+  //               encoding of 0208. Lead byte ranges: 0x81-0x9F, 0xE0-0xEF; Trail byte ranges: 0x40-0x7E, 0x80-0x9E, 0x9F-0xFC.
+  //               Windows CP932 is a superset of Shift_JIS. Some companies added more chars, notably KDDI.
+  //  * EUC-JP:    Up to 3 bytes per character. Used mostly on *nixes.
+  //               0x00-0x7F       - lower part of 0201
+  //               0x8E, 0xA1-0xDF - upper part of 0201
+  //               (0xA1-0xFE)x2   - 0208 plane (94x94).
+  //               0x8F, (0xA1-0xFE)x2 - 0212 plane (94x94).
+  //  * JIS X 208: 7-bit, direct encoding of 0208. Byte ranges: 0x21-0x7E (94 values). Uncommon.
+  //               Used as-is in ISO2022 family.
+  //  * ISO2022-JP: Stateful encoding, with escape sequences to switch between ASCII,
+  //                0201-1976 Roman, 0208-1978, 0208-1983.
+  //  * ISO2022-JP-1: Adds esc seq for 0212-1990.
+  //  * ISO2022-JP-2: Adds esc seq for GB2313-1980, KSX1001-1992, ISO8859-1, ISO8859-7.
+  //  * ISO2022-JP-3: Adds esc seq for 0201-1976 Kana set, 0213-2000 Planes 1, 2.
+  //  * ISO2022-JP-2004: Adds 0213-2004 Plane 1.
+  //
+  // After JIS X 0213 appeared, Shift_JIS-2004, EUC-JISX0213 and ISO2022-JP-2004 followed, with just changing the planes.
+  //
+  // Overall, it seems that it's a mess :( http://www8.plala.or.jp/tkubota1/unicode-symbols-map2.html
 
-    'eucjp': {
-        type: '_dbcs',
-        table: function() { return __nccwpck_require__(6406) },
-        encodeAdd: {'\u00a5': 0x5C, '\u203E': 0x7E},
-    },
+  shiftjis: {
+    type: "_dbcs",
+    table: function () { return __nccwpck_require__(679) },
+    encodeAdd: { "\u00a5": 0x5C, "\u203E": 0x7E },
+    encodeSkipVals: [{ from: 0xED40, to: 0xF940 }]
+  },
+  csshiftjis: "shiftjis",
+  mskanji: "shiftjis",
+  sjis: "shiftjis",
+  windows31j: "shiftjis",
+  ms31j: "shiftjis",
+  xsjis: "shiftjis",
+  windows932: "shiftjis",
+  ms932: "shiftjis",
+  932: "shiftjis",
+  cp932: "shiftjis",
 
-    // TODO: KDDI extension to Shift_JIS
-    // TODO: IBM CCSID 942 = CP932, but F0-F9 custom chars and other char changes.
-    // TODO: IBM CCSID 943 = Shift_JIS = CP932 with original Shift_JIS lower 128 chars.
+  eucjp: {
+    type: "_dbcs",
+    table: function () { return __nccwpck_require__(6406) },
+    encodeAdd: { "\u00a5": 0x5C, "\u203E": 0x7E }
+  },
 
+  // TODO: KDDI extension to Shift_JIS
+  // TODO: IBM CCSID 942 = CP932, but F0-F9 custom chars and other char changes.
+  // TODO: IBM CCSID 943 = Shift_JIS = CP932 with original Shift_JIS lower 128 chars.
 
-    // == Chinese/GBK ==========================================================
-    // http://en.wikipedia.org/wiki/GBK
-    // We mostly implement W3C recommendation: https://www.w3.org/TR/encoding/#gbk-encoder
+  // == Chinese/GBK ==========================================================
+  // http://en.wikipedia.org/wiki/GBK
+  // We mostly implement W3C recommendation: https://www.w3.org/TR/encoding/#gbk-encoder
 
-    // Oldest GB2312 (1981, ~7600 chars) is a subset of CP936
-    'gb2312': 'cp936',
-    'gb231280': 'cp936',
-    'gb23121980': 'cp936',
-    'csgb2312': 'cp936',
-    'csiso58gb231280': 'cp936',
-    'euccn': 'cp936',
+  // Oldest GB2312 (1981, ~7600 chars) is a subset of CP936
+  gb2312: "cp936",
+  gb231280: "cp936",
+  gb23121980: "cp936",
+  csgb2312: "cp936",
+  csiso58gb231280: "cp936",
+  euccn: "cp936",
 
-    // Microsoft's CP936 is a subset and approximation of GBK.
-    'windows936': 'cp936',
-    'ms936': 'cp936',
-    '936': 'cp936',
-    'cp936': {
-        type: '_dbcs',
-        table: function() { return __nccwpck_require__(2107) },
-    },
+  // Microsoft's CP936 is a subset and approximation of GBK.
+  windows936: "cp936",
+  ms936: "cp936",
+  936: "cp936",
+  cp936: {
+    type: "_dbcs",
+    table: function () { return __nccwpck_require__(2107) }
+  },
 
-    // GBK (~22000 chars) is an extension of CP936 that added user-mapped chars and some other.
-    'gbk': {
-        type: '_dbcs',
-        table: function() { return (__nccwpck_require__(2107).concat)(__nccwpck_require__(5914)) },
-    },
-    'xgbk': 'gbk',
-    'isoir58': 'gbk',
+  // GBK (~22000 chars) is an extension of CP936 that added user-mapped chars and some other.
+  gbk: {
+    type: "_dbcs",
+    table: function () { return (__nccwpck_require__(2107).concat)(__nccwpck_require__(5914)) }
+  },
+  xgbk: "gbk",
+  isoir58: "gbk",
 
-    // GB18030 is an algorithmic extension of GBK.
-    // Main source: https://www.w3.org/TR/encoding/#gbk-encoder
-    // http://icu-project.org/docs/papers/gb18030.html
-    // http://source.icu-project.org/repos/icu/data/trunk/charset/data/xml/gb-18030-2000.xml
-    // http://www.khngai.com/chinese/charmap/tblgbk.php?page=0
-    'gb18030': {
-        type: '_dbcs',
-        table: function() { return (__nccwpck_require__(2107).concat)(__nccwpck_require__(5914)) },
-        gb18030: function() { return __nccwpck_require__(9129) },
-        encodeSkipVals: [0x80],
-        encodeAdd: {'€': 0xA2E3},
-    },
+  // GB18030 is an algorithmic extension of GBK.
+  // Main source: https://www.w3.org/TR/encoding/#gbk-encoder
+  // http://icu-project.org/docs/papers/gb18030.html
+  // http://source.icu-project.org/repos/icu/data/trunk/charset/data/xml/gb-18030-2000.xml
+  // http://www.khngai.com/chinese/charmap/tblgbk.php?page=0
+  gb18030: {
+    type: "_dbcs",
+    table: function () { return (__nccwpck_require__(2107).concat)(__nccwpck_require__(5914)) },
+    gb18030: function () { return __nccwpck_require__(9129) },
+    encodeSkipVals: [0x80],
+    encodeAdd: { "€": 0xA2E3 }
+  },
 
-    'chinese': 'gb18030',
+  chinese: "gb18030",
 
+  // == Korean ===============================================================
+  // EUC-KR, KS_C_5601 and KS X 1001 are exactly the same.
+  windows949: "cp949",
+  ms949: "cp949",
+  949: "cp949",
+  cp949: {
+    type: "_dbcs",
+    table: function () { return __nccwpck_require__(1166) }
+  },
 
-    // == Korean ===============================================================
-    // EUC-KR, KS_C_5601 and KS X 1001 are exactly the same.
-    'windows949': 'cp949',
-    'ms949': 'cp949',
-    '949': 'cp949',
-    'cp949': {
-        type: '_dbcs',
-        table: function() { return __nccwpck_require__(1166) },
-    },
+  cseuckr: "cp949",
+  csksc56011987: "cp949",
+  euckr: "cp949",
+  isoir149: "cp949",
+  korean: "cp949",
+  ksc56011987: "cp949",
+  ksc56011989: "cp949",
+  ksc5601: "cp949",
 
-    'cseuckr': 'cp949',
-    'csksc56011987': 'cp949',
-    'euckr': 'cp949',
-    'isoir149': 'cp949',
-    'korean': 'cp949',
-    'ksc56011987': 'cp949',
-    'ksc56011989': 'cp949',
-    'ksc5601': 'cp949',
+  // == Big5/Taiwan/Hong Kong ================================================
+  // There are lots of tables for Big5 and cp950. Please see the following links for history:
+  // http://moztw.org/docs/big5/  http://www.haible.de/bruno/charsets/conversion-tables/Big5.html
+  // Variations, in roughly number of defined chars:
+  //  * Windows CP 950: Microsoft variant of Big5. Canonical: http://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP950.TXT
+  //  * Windows CP 951: Microsoft variant of Big5-HKSCS-2001. Seems to be never public. http://me.abelcheung.org/articles/research/what-is-cp951/
+  //  * Big5-2003 (Taiwan standard) almost superset of cp950.
+  //  * Unicode-at-on (UAO) / Mozilla 1.8. Falling out of use on the Web. Not supported by other browsers.
+  //  * Big5-HKSCS (-2001, -2004, -2008). Hong Kong standard.
+  //    many unicode code points moved from PUA to Supplementary plane (U+2XXXX) over the years.
+  //    Plus, it has 4 combining sequences.
+  //    Seems that Mozilla refused to support it for 10 yrs. https://bugzilla.mozilla.org/show_bug.cgi?id=162431 https://bugzilla.mozilla.org/show_bug.cgi?id=310299
+  //    because big5-hkscs is the only encoding to include astral characters in non-algorithmic way.
+  //    Implementations are not consistent within browsers; sometimes labeled as just big5.
+  //    MS Internet Explorer switches from big5 to big5-hkscs when a patch applied.
+  //    Great discussion & recap of what's going on https://bugzilla.mozilla.org/show_bug.cgi?id=912470#c31
+  //    In the encoder, it might make sense to support encoding old PUA mappings to Big5 bytes seq-s.
+  //    Official spec: http://www.ogcio.gov.hk/en/business/tech_promotion/ccli/terms/doc/2003cmp_2008.txt
+  //                   http://www.ogcio.gov.hk/tc/business/tech_promotion/ccli/terms/doc/hkscs-2008-big5-iso.txt
+  //
+  // Current understanding of how to deal with Big5(-HKSCS) is in the Encoding Standard, http://encoding.spec.whatwg.org/#big5-encoder
+  // Unicode mapping (http://www.unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/OTHER/BIG5.TXT) is said to be wrong.
 
+  windows950: "cp950",
+  ms950: "cp950",
+  950: "cp950",
+  cp950: {
+    type: "_dbcs",
+    table: function () { return __nccwpck_require__(2324) }
+  },
 
-    // == Big5/Taiwan/Hong Kong ================================================
-    // There are lots of tables for Big5 and cp950. Please see the following links for history:
-    // http://moztw.org/docs/big5/  http://www.haible.de/bruno/charsets/conversion-tables/Big5.html
-    // Variations, in roughly number of defined chars:
-    //  * Windows CP 950: Microsoft variant of Big5. Canonical: http://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP950.TXT
-    //  * Windows CP 951: Microsoft variant of Big5-HKSCS-2001. Seems to be never public. http://me.abelcheung.org/articles/research/what-is-cp951/
-    //  * Big5-2003 (Taiwan standard) almost superset of cp950.
-    //  * Unicode-at-on (UAO) / Mozilla 1.8. Falling out of use on the Web. Not supported by other browsers.
-    //  * Big5-HKSCS (-2001, -2004, -2008). Hong Kong standard. 
-    //    many unicode code points moved from PUA to Supplementary plane (U+2XXXX) over the years.
-    //    Plus, it has 4 combining sequences.
-    //    Seems that Mozilla refused to support it for 10 yrs. https://bugzilla.mozilla.org/show_bug.cgi?id=162431 https://bugzilla.mozilla.org/show_bug.cgi?id=310299
-    //    because big5-hkscs is the only encoding to include astral characters in non-algorithmic way.
-    //    Implementations are not consistent within browsers; sometimes labeled as just big5.
-    //    MS Internet Explorer switches from big5 to big5-hkscs when a patch applied.
-    //    Great discussion & recap of what's going on https://bugzilla.mozilla.org/show_bug.cgi?id=912470#c31
-    //    In the encoder, it might make sense to support encoding old PUA mappings to Big5 bytes seq-s.
-    //    Official spec: http://www.ogcio.gov.hk/en/business/tech_promotion/ccli/terms/doc/2003cmp_2008.txt
-    //                   http://www.ogcio.gov.hk/tc/business/tech_promotion/ccli/terms/doc/hkscs-2008-big5-iso.txt
-    // 
-    // Current understanding of how to deal with Big5(-HKSCS) is in the Encoding Standard, http://encoding.spec.whatwg.org/#big5-encoder
-    // Unicode mapping (http://www.unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/OTHER/BIG5.TXT) is said to be wrong.
+  // Big5 has many variations and is an extension of cp950. We use Encoding Standard's as a consensus.
+  big5: "big5hkscs",
+  big5hkscs: {
+    type: "_dbcs",
+    table: function () { return (__nccwpck_require__(2324).concat)(__nccwpck_require__(3267)) },
+    encodeSkipVals: [
+      // Although Encoding Standard says we should avoid encoding to HKSCS area (See Step 1 of
+      // https://encoding.spec.whatwg.org/#index-big5-pointer), we still do it to increase compatibility with ICU.
+      // But if a single unicode point can be encoded both as HKSCS and regular Big5, we prefer the latter.
+      0x8e69, 0x8e6f, 0x8e7e, 0x8eab, 0x8eb4, 0x8ecd, 0x8ed0, 0x8f57, 0x8f69, 0x8f6e, 0x8fcb, 0x8ffe,
+      0x906d, 0x907a, 0x90c4, 0x90dc, 0x90f1, 0x91bf, 0x92af, 0x92b0, 0x92b1, 0x92b2, 0x92d1, 0x9447, 0x94ca,
+      0x95d9, 0x96fc, 0x9975, 0x9b76, 0x9b78, 0x9b7b, 0x9bc6, 0x9bde, 0x9bec, 0x9bf6, 0x9c42, 0x9c53, 0x9c62,
+      0x9c68, 0x9c6b, 0x9c77, 0x9cbc, 0x9cbd, 0x9cd0, 0x9d57, 0x9d5a, 0x9dc4, 0x9def, 0x9dfb, 0x9ea9, 0x9eef,
+      0x9efd, 0x9f60, 0x9fcb, 0xa077, 0xa0dc, 0xa0df, 0x8fcc, 0x92c8, 0x9644, 0x96ed,
 
-    'windows950': 'cp950',
-    'ms950': 'cp950',
-    '950': 'cp950',
-    'cp950': {
-        type: '_dbcs',
-        table: function() { return __nccwpck_require__(2324) },
-    },
+      // Step 2 of https://encoding.spec.whatwg.org/#index-big5-pointer: Use last pointer for U+2550, U+255E, U+2561, U+256A, U+5341, or U+5345
+      0xa2a4, 0xa2a5, 0xa2a7, 0xa2a6, 0xa2cc, 0xa2ce
+    ]
+  },
 
-    // Big5 has many variations and is an extension of cp950. We use Encoding Standard's as a consensus.
-    'big5': 'big5hkscs',
-    'big5hkscs': {
-        type: '_dbcs',
-        table: function() { return (__nccwpck_require__(2324).concat)(__nccwpck_require__(3267)) },
-        encodeSkipVals: [0xa2cc],
-    },
-
-    'cnbig5': 'big5hkscs',
-    'csbig5': 'big5hkscs',
-    'xxbig5': 'big5hkscs',
-};
+  cnbig5: "big5hkscs",
+  csbig5: "big5hkscs",
+  xxbig5: "big5hkscs"
+}
 
 
 /***/ }),
@@ -16509,26 +15400,26 @@ module.exports = {
 "use strict";
 
 
+var mergeModules = __nccwpck_require__(5336)
+
 // Update this array if you add/rename/remove files in this directory.
 // We support Browserify by skipping automatic module discovery and requiring modules directly.
 var modules = [
-    __nccwpck_require__(2356),
-    __nccwpck_require__(4402),
-    __nccwpck_require__(8771),
-    __nccwpck_require__(8231),
-    __nccwpck_require__(2473),
-    __nccwpck_require__(7083),
-    __nccwpck_require__(9487),
-    __nccwpck_require__(7978),
-    __nccwpck_require__(1802),
-];
+  __nccwpck_require__(2356),
+  __nccwpck_require__(4402),
+  __nccwpck_require__(8771),
+  __nccwpck_require__(8231),
+  __nccwpck_require__(2473),
+  __nccwpck_require__(7083),
+  __nccwpck_require__(9487),
+  __nccwpck_require__(7978),
+  __nccwpck_require__(1802)
+]
 
 // Put all encoding/alias/codec definitions to single object and export it.
 for (var i = 0; i < modules.length; i++) {
-    var module = modules[i];
-    for (var enc in module)
-        if (Object.prototype.hasOwnProperty.call(module, enc))
-            exports[enc] = module[enc];
+  var module = modules[i]
+  mergeModules(exports, module)
 }
 
 
@@ -16539,192 +15430,222 @@ for (var i = 0; i < modules.length; i++) {
 
 "use strict";
 
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
 // Export Node.js internal encodings.
 
 module.exports = {
-    // Encodings
-    utf8:   { type: "_internal", bomAware: true},
-    cesu8:  { type: "_internal", bomAware: true},
-    unicode11utf8: "utf8",
+  // Encodings
+  utf8: { type: "_internal", bomAware: true },
+  cesu8: { type: "_internal", bomAware: true },
+  unicode11utf8: "utf8",
 
-    ucs2:   { type: "_internal", bomAware: true},
-    utf16le: "ucs2",
+  ucs2: { type: "_internal", bomAware: true },
+  utf16le: "ucs2",
 
-    binary: { type: "_internal" },
-    base64: { type: "_internal" },
-    hex:    { type: "_internal" },
+  binary: { type: "_internal" },
+  base64: { type: "_internal" },
+  hex: { type: "_internal" },
 
-    // Codec.
-    _internal: InternalCodec,
-};
-
-//------------------------------------------------------------------------------
-
-function InternalCodec(codecOptions, iconv) {
-    this.enc = codecOptions.encodingName;
-    this.bomAware = codecOptions.bomAware;
-
-    if (this.enc === "base64")
-        this.encoder = InternalEncoderBase64;
-    else if (this.enc === "cesu8") {
-        this.enc = "utf8"; // Use utf8 for decoding.
-        this.encoder = InternalEncoderCesu8;
-
-        // Add decoder for versions of Node not supporting CESU-8
-        if (Buffer.from('eda0bdedb2a9', 'hex').toString() !== '💩') {
-            this.decoder = InternalDecoderCesu8;
-            this.defaultCharUnicode = iconv.defaultCharUnicode;
-        }
-    }
+  // Codec.
+  _internal: InternalCodec
 }
 
-InternalCodec.prototype.encoder = InternalEncoder;
-InternalCodec.prototype.decoder = InternalDecoder;
+// ------------------------------------------------------------------------------
 
-//------------------------------------------------------------------------------
+function InternalCodec (codecOptions, iconv) {
+  this.enc = codecOptions.encodingName
+  this.bomAware = codecOptions.bomAware
+
+  if (this.enc === "base64") { this.encoder = InternalEncoderBase64 } else if (this.enc === "utf8") { this.encoder = InternalEncoderUtf8 } else if (this.enc === "cesu8") {
+    this.enc = "utf8" // Use utf8 for decoding.
+    this.encoder = InternalEncoderCesu8
+
+    // Add decoder for versions of Node not supporting CESU-8
+    if (Buffer.from("eda0bdedb2a9", "hex").toString() !== "💩") {
+      this.decoder = InternalDecoderCesu8
+      this.defaultCharUnicode = iconv.defaultCharUnicode
+    }
+  }
+}
+
+InternalCodec.prototype.encoder = InternalEncoder
+InternalCodec.prototype.decoder = InternalDecoder
+
+// ------------------------------------------------------------------------------
 
 // We use node.js internal decoder. Its signature is the same as ours.
-var StringDecoder = (__nccwpck_require__(3193).StringDecoder);
+var StringDecoder = (__nccwpck_require__(3193).StringDecoder)
 
-if (!StringDecoder.prototype.end) // Node v0.8 doesn't have this method.
-    StringDecoder.prototype.end = function() {};
-
-
-function InternalDecoder(options, codec) {
-    StringDecoder.call(this, codec.enc);
+function InternalDecoder (options, codec) {
+  this.decoder = new StringDecoder(codec.enc)
 }
 
-InternalDecoder.prototype = StringDecoder.prototype;
+InternalDecoder.prototype.write = function (buf) {
+  if (!Buffer.isBuffer(buf)) {
+    buf = Buffer.from(buf)
+  }
 
+  return this.decoder.write(buf)
+}
 
-//------------------------------------------------------------------------------
+InternalDecoder.prototype.end = function () {
+  return this.decoder.end()
+}
+
+// ------------------------------------------------------------------------------
 // Encoder is mostly trivial
 
-function InternalEncoder(options, codec) {
-    this.enc = codec.enc;
+function InternalEncoder (options, codec) {
+  this.enc = codec.enc
 }
 
-InternalEncoder.prototype.write = function(str) {
-    return Buffer.from(str, this.enc);
+InternalEncoder.prototype.write = function (str) {
+  return Buffer.from(str, this.enc)
 }
 
-InternalEncoder.prototype.end = function() {
+InternalEncoder.prototype.end = function () {
 }
 
-
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 // Except base64 encoder, which must keep its state.
 
-function InternalEncoderBase64(options, codec) {
-    this.prevStr = '';
+function InternalEncoderBase64 (options, codec) {
+  this.prevStr = ""
 }
 
-InternalEncoderBase64.prototype.write = function(str) {
-    str = this.prevStr + str;
-    var completeQuads = str.length - (str.length % 4);
-    this.prevStr = str.slice(completeQuads);
-    str = str.slice(0, completeQuads);
+InternalEncoderBase64.prototype.write = function (str) {
+  str = this.prevStr + str
+  var completeQuads = str.length - (str.length % 4)
+  this.prevStr = str.slice(completeQuads)
+  str = str.slice(0, completeQuads)
 
-    return Buffer.from(str, "base64");
+  return Buffer.from(str, "base64")
 }
 
-InternalEncoderBase64.prototype.end = function() {
-    return Buffer.from(this.prevStr, "base64");
+InternalEncoderBase64.prototype.end = function () {
+  return Buffer.from(this.prevStr, "base64")
 }
 
-
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 // CESU-8 encoder is also special.
 
-function InternalEncoderCesu8(options, codec) {
+function InternalEncoderCesu8 (options, codec) {
 }
 
-InternalEncoderCesu8.prototype.write = function(str) {
-    var buf = Buffer.alloc(str.length * 3), bufIdx = 0;
-    for (var i = 0; i < str.length; i++) {
-        var charCode = str.charCodeAt(i);
-        // Naive implementation, but it works because CESU-8 is especially easy
-        // to convert from UTF-16 (which all JS strings are encoded in).
-        if (charCode < 0x80)
-            buf[bufIdx++] = charCode;
-        else if (charCode < 0x800) {
-            buf[bufIdx++] = 0xC0 + (charCode >>> 6);
-            buf[bufIdx++] = 0x80 + (charCode & 0x3f);
-        }
-        else { // charCode will always be < 0x10000 in javascript.
-            buf[bufIdx++] = 0xE0 + (charCode >>> 12);
-            buf[bufIdx++] = 0x80 + ((charCode >>> 6) & 0x3f);
-            buf[bufIdx++] = 0x80 + (charCode & 0x3f);
-        }
+InternalEncoderCesu8.prototype.write = function (str) {
+  var buf = Buffer.alloc(str.length * 3); var bufIdx = 0
+  for (var i = 0; i < str.length; i++) {
+    var charCode = str.charCodeAt(i)
+    // Naive implementation, but it works because CESU-8 is especially easy
+    // to convert from UTF-16 (which all JS strings are encoded in).
+    if (charCode < 0x80) { buf[bufIdx++] = charCode } else if (charCode < 0x800) {
+      buf[bufIdx++] = 0xC0 + (charCode >>> 6)
+      buf[bufIdx++] = 0x80 + (charCode & 0x3f)
+    } else { // charCode will always be < 0x10000 in javascript.
+      buf[bufIdx++] = 0xE0 + (charCode >>> 12)
+      buf[bufIdx++] = 0x80 + ((charCode >>> 6) & 0x3f)
+      buf[bufIdx++] = 0x80 + (charCode & 0x3f)
     }
-    return buf.slice(0, bufIdx);
+  }
+  return buf.slice(0, bufIdx)
 }
 
-InternalEncoderCesu8.prototype.end = function() {
+InternalEncoderCesu8.prototype.end = function () {
 }
 
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 // CESU-8 decoder is not implemented in Node v4.0+
 
-function InternalDecoderCesu8(options, codec) {
-    this.acc = 0;
-    this.contBytes = 0;
-    this.accBytes = 0;
-    this.defaultCharUnicode = codec.defaultCharUnicode;
+function InternalDecoderCesu8 (options, codec) {
+  this.acc = 0
+  this.contBytes = 0
+  this.accBytes = 0
+  this.defaultCharUnicode = codec.defaultCharUnicode
 }
 
-InternalDecoderCesu8.prototype.write = function(buf) {
-    var acc = this.acc, contBytes = this.contBytes, accBytes = this.accBytes, 
-        res = '';
-    for (var i = 0; i < buf.length; i++) {
-        var curByte = buf[i];
-        if ((curByte & 0xC0) !== 0x80) { // Leading byte
-            if (contBytes > 0) { // Previous code is invalid
-                res += this.defaultCharUnicode;
-                contBytes = 0;
-            }
+InternalDecoderCesu8.prototype.write = function (buf) {
+  var acc = this.acc; var contBytes = this.contBytes; var accBytes = this.accBytes
+  var res = ""
+  for (var i = 0; i < buf.length; i++) {
+    var curByte = buf[i]
+    if ((curByte & 0xC0) !== 0x80) { // Leading byte
+      if (contBytes > 0) { // Previous code is invalid
+        res += this.defaultCharUnicode
+        contBytes = 0
+      }
 
-            if (curByte < 0x80) { // Single-byte code
-                res += String.fromCharCode(curByte);
-            } else if (curByte < 0xE0) { // Two-byte code
-                acc = curByte & 0x1F;
-                contBytes = 1; accBytes = 1;
-            } else if (curByte < 0xF0) { // Three-byte code
-                acc = curByte & 0x0F;
-                contBytes = 2; accBytes = 1;
-            } else { // Four or more are not supported for CESU-8.
-                res += this.defaultCharUnicode;
-            }
-        } else { // Continuation byte
-            if (contBytes > 0) { // We're waiting for it.
-                acc = (acc << 6) | (curByte & 0x3f);
-                contBytes--; accBytes++;
-                if (contBytes === 0) {
-                    // Check for overlong encoding, but support Modified UTF-8 (encoding NULL as C0 80)
-                    if (accBytes === 2 && acc < 0x80 && acc > 0)
-                        res += this.defaultCharUnicode;
-                    else if (accBytes === 3 && acc < 0x800)
-                        res += this.defaultCharUnicode;
-                    else
-                        // Actually add character.
-                        res += String.fromCharCode(acc);
-                }
-            } else { // Unexpected continuation byte
-                res += this.defaultCharUnicode;
-            }
+      if (curByte < 0x80) { // Single-byte code
+        res += String.fromCharCode(curByte)
+      } else if (curByte < 0xE0) { // Two-byte code
+        acc = curByte & 0x1F
+        contBytes = 1; accBytes = 1
+      } else if (curByte < 0xF0) { // Three-byte code
+        acc = curByte & 0x0F
+        contBytes = 2; accBytes = 1
+      } else { // Four or more are not supported for CESU-8.
+        res += this.defaultCharUnicode
+      }
+    } else { // Continuation byte
+      if (contBytes > 0) { // We're waiting for it.
+        acc = (acc << 6) | (curByte & 0x3f)
+        contBytes--; accBytes++
+        if (contBytes === 0) {
+          // Check for overlong encoding, but support Modified UTF-8 (encoding NULL as C0 80)
+          if (accBytes === 2 && acc < 0x80 && acc > 0) {
+            res += this.defaultCharUnicode
+          } else if (accBytes === 3 && acc < 0x800) {
+            res += this.defaultCharUnicode
+          } else {
+            // Actually add character.
+            res += String.fromCharCode(acc)
+          }
         }
+      } else { // Unexpected continuation byte
+        res += this.defaultCharUnicode
+      }
     }
-    this.acc = acc; this.contBytes = contBytes; this.accBytes = accBytes;
-    return res;
+  }
+  this.acc = acc; this.contBytes = contBytes; this.accBytes = accBytes
+  return res
 }
 
-InternalDecoderCesu8.prototype.end = function() {
-    var res = 0;
-    if (this.contBytes > 0)
-        res += this.defaultCharUnicode;
-    return res;
+InternalDecoderCesu8.prototype.end = function () {
+  var res = 0
+  if (this.contBytes > 0) { res += this.defaultCharUnicode }
+  return res
+}
+
+// ------------------------------------------------------------------------------
+// check the chunk boundaries for surrogate pair
+
+function InternalEncoderUtf8 (options, codec) {
+  this.highSurrogate = ""
+}
+
+InternalEncoderUtf8.prototype.write = function (str) {
+  if (this.highSurrogate) {
+    str = this.highSurrogate + str
+    this.highSurrogate = ""
+  }
+
+  if (str.length > 0) {
+    var charCode = str.charCodeAt(str.length - 1)
+    if (charCode >= 0xd800 && charCode < 0xdc00) {
+      this.highSurrogate = str[str.length - 1]
+      str = str.slice(0, str.length - 1)
+    }
+  }
+
+  return Buffer.from(str, this.enc)
+}
+
+InternalEncoderUtf8.prototype.end = function () {
+  if (this.highSurrogate) {
+    var str = this.highSurrogate
+    this.highSurrogate = ""
+    return Buffer.from(str, this.enc)
+  }
 }
 
 
@@ -16735,76 +15656,79 @@ InternalDecoderCesu8.prototype.end = function() {
 
 "use strict";
 
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
 // Single-byte codec. Needs a 'chars' string parameter that contains 256 or 128 chars that
-// correspond to encoded bytes (if 128 - then lower half is ASCII). 
+// correspond to encoded bytes (if 128 - then lower half is ASCII).
 
-exports._sbcs = SBCSCodec;
-function SBCSCodec(codecOptions, iconv) {
-    if (!codecOptions)
-        throw new Error("SBCS codec is called without the data.")
-    
-    // Prepare char buffer for decoding.
-    if (!codecOptions.chars || (codecOptions.chars.length !== 128 && codecOptions.chars.length !== 256))
-        throw new Error("Encoding '"+codecOptions.type+"' has incorrect 'chars' (must be of len 128 or 256)");
-    
-    if (codecOptions.chars.length === 128) {
-        var asciiString = "";
-        for (var i = 0; i < 128; i++)
-            asciiString += String.fromCharCode(i);
-        codecOptions.chars = asciiString + codecOptions.chars;
+exports._sbcs = SBCSCodec
+function SBCSCodec (codecOptions, iconv) {
+  if (!codecOptions) {
+    throw new Error("SBCS codec is called without the data.")
+  }
+
+  // Prepare char buffer for decoding.
+  if (!codecOptions.chars || (codecOptions.chars.length !== 128 && codecOptions.chars.length !== 256)) {
+    throw new Error("Encoding '" + codecOptions.type + "' has incorrect 'chars' (must be of len 128 or 256)")
+  }
+
+  if (codecOptions.chars.length === 128) {
+    var asciiString = ""
+    for (var i = 0; i < 128; i++) {
+      asciiString += String.fromCharCode(i)
     }
+    codecOptions.chars = asciiString + codecOptions.chars
+  }
 
-    this.decodeBuf = Buffer.from(codecOptions.chars, 'ucs2');
-    
-    // Encoding buffer.
-    var encodeBuf = Buffer.alloc(65536, iconv.defaultCharSingleByte.charCodeAt(0));
+  this.decodeBuf = Buffer.from(codecOptions.chars, "ucs2")
 
-    for (var i = 0; i < codecOptions.chars.length; i++)
-        encodeBuf[codecOptions.chars.charCodeAt(i)] = i;
+  // Encoding buffer.
+  var encodeBuf = Buffer.alloc(65536, iconv.defaultCharSingleByte.charCodeAt(0))
 
-    this.encodeBuf = encodeBuf;
+  for (var i = 0; i < codecOptions.chars.length; i++) {
+    encodeBuf[codecOptions.chars.charCodeAt(i)] = i
+  }
+
+  this.encodeBuf = encodeBuf
 }
 
-SBCSCodec.prototype.encoder = SBCSEncoder;
-SBCSCodec.prototype.decoder = SBCSDecoder;
+SBCSCodec.prototype.encoder = SBCSEncoder
+SBCSCodec.prototype.decoder = SBCSDecoder
 
-
-function SBCSEncoder(options, codec) {
-    this.encodeBuf = codec.encodeBuf;
+function SBCSEncoder (options, codec) {
+  this.encodeBuf = codec.encodeBuf
 }
 
-SBCSEncoder.prototype.write = function(str) {
-    var buf = Buffer.alloc(str.length);
-    for (var i = 0; i < str.length; i++)
-        buf[i] = this.encodeBuf[str.charCodeAt(i)];
-    
-    return buf;
+SBCSEncoder.prototype.write = function (str) {
+  var buf = Buffer.alloc(str.length)
+  for (var i = 0; i < str.length; i++) {
+    buf[i] = this.encodeBuf[str.charCodeAt(i)]
+  }
+
+  return buf
 }
 
-SBCSEncoder.prototype.end = function() {
+SBCSEncoder.prototype.end = function () {
 }
 
-
-function SBCSDecoder(options, codec) {
-    this.decodeBuf = codec.decodeBuf;
+function SBCSDecoder (options, codec) {
+  this.decodeBuf = codec.decodeBuf
 }
 
-SBCSDecoder.prototype.write = function(buf) {
-    // Strings are immutable in JS -> we use ucs2 buffer to speed up computations.
-    var decodeBuf = this.decodeBuf;
-    var newBuf = Buffer.alloc(buf.length*2);
-    var idx1 = 0, idx2 = 0;
-    for (var i = 0; i < buf.length; i++) {
-        idx1 = buf[i]*2; idx2 = i*2;
-        newBuf[idx2] = decodeBuf[idx1];
-        newBuf[idx2+1] = decodeBuf[idx1+1];
-    }
-    return newBuf.toString('ucs2');
+SBCSDecoder.prototype.write = function (buf) {
+  // Strings are immutable in JS -> we use ucs2 buffer to speed up computations.
+  var decodeBuf = this.decodeBuf
+  var newBuf = Buffer.alloc(buf.length * 2)
+  var idx1 = 0; var idx2 = 0
+  for (var i = 0; i < buf.length; i++) {
+    idx1 = buf[i] * 2; idx2 = i * 2
+    newBuf[idx2] = decodeBuf[idx1]
+    newBuf[idx2 + 1] = decodeBuf[idx1 + 1]
+  }
+  return newBuf.toString("ucs2")
 }
 
-SBCSDecoder.prototype.end = function() {
+SBCSDecoder.prototype.end = function () {
 }
 
 
@@ -17277,180 +16201,181 @@ module.exports = {
 // Manually added data to be used by sbcs codec in addition to generated one.
 
 module.exports = {
-    // Not supported by iconv, not sure why.
-    "10029": "maccenteuro",
-    "maccenteuro": {
-        "type": "_sbcs",
-        "chars": "ÄĀāÉĄÖÜáąČäčĆćéŹźĎíďĒēĖóėôöõúĚěü†°Ę£§•¶ß®©™ę¨≠ģĮįĪ≤≥īĶ∂∑łĻļĽľĹĺŅņŃ¬√ńŇ∆«»… ňŐÕőŌ–—“”‘’÷◊ōŔŕŘ‹›řŖŗŠ‚„šŚśÁŤťÍŽžŪÓÔūŮÚůŰűŲųÝýķŻŁżĢˇ"
-    },
+  // Not supported by iconv, not sure why.
+  10029: "maccenteuro",
+  maccenteuro: {
+    type: "_sbcs",
+    chars: "ÄĀāÉĄÖÜáąČäčĆćéŹźĎíďĒēĖóėôöõúĚěü†°Ę£§•¶ß®©™ę¨≠ģĮįĪ≤≥īĶ∂∑łĻļĽľĹĺŅņŃ¬√ńŇ∆«»… ňŐÕőŌ–—“”‘’÷◊ōŔŕŘ‹›řŖŗŠ‚„šŚśÁŤťÍŽžŪÓÔūŮÚůŰűŲųÝýķŻŁżĢˇ"
+  },
 
-    "808": "cp808",
-    "ibm808": "cp808",
-    "cp808": {
-        "type": "_sbcs",
-        "chars": "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмноп░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀рстуфхцчшщъыьэюяЁёЄєЇїЎў°∙·√№€■ "
-    },
+  808: "cp808",
+  ibm808: "cp808",
+  cp808: {
+    type: "_sbcs",
+    chars: "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмноп░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀рстуфхцчшщъыьэюяЁёЄєЇїЎў°∙·√№€■ "
+  },
 
-    "mik": {
-        "type": "_sbcs",
-        "chars": "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя└┴┬├─┼╣║╚╔╩╦╠═╬┐░▒▓│┤№§╗╝┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ "
-    },
+  mik: {
+    type: "_sbcs",
+    chars: "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя└┴┬├─┼╣║╚╔╩╦╠═╬┐░▒▓│┤№§╗╝┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ "
+  },
 
-    "cp720": {
-        "type": "_sbcs",
-        "chars": "\x80\x81éâ\x84à\x86çêëèïî\x8d\x8e\x8f\x90\u0651\u0652ô¤ـûùءآأؤ£إئابةتثجحخدذرزسشص«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀ضطظعغفµقكلمنهوىي≡\u064b\u064c\u064d\u064e\u064f\u0650≈°∙·√ⁿ²■\u00a0"
-    },
+  cp720: {
+    type: "_sbcs",
+    chars: "\x80\x81éâ\x84à\x86çêëèïî\x8d\x8e\x8f\x90\u0651\u0652ô¤ـûùءآأؤ£إئابةتثجحخدذرزسشص«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀ضطظعغفµقكلمنهوىي≡\u064b\u064c\u064d\u064e\u064f\u0650≈°∙·√ⁿ²■\u00a0"
+  },
 
-    // Aliases of generated encodings.
-    "ascii8bit": "ascii",
-    "usascii": "ascii",
-    "ansix34": "ascii",
-    "ansix341968": "ascii",
-    "ansix341986": "ascii",
-    "csascii": "ascii",
-    "cp367": "ascii",
-    "ibm367": "ascii",
-    "isoir6": "ascii",
-    "iso646us": "ascii",
-    "iso646irv": "ascii",
-    "us": "ascii",
+  // Aliases of generated encodings.
+  ascii8bit: "ascii",
+  usascii: "ascii",
+  ansix34: "ascii",
+  ansix341968: "ascii",
+  ansix341986: "ascii",
+  csascii: "ascii",
+  cp367: "ascii",
+  ibm367: "ascii",
+  isoir6: "ascii",
+  iso646us: "ascii",
+  iso646irv: "ascii",
+  us: "ascii",
 
-    "latin1": "iso88591",
-    "latin2": "iso88592",
-    "latin3": "iso88593",
-    "latin4": "iso88594",
-    "latin5": "iso88599",
-    "latin6": "iso885910",
-    "latin7": "iso885913",
-    "latin8": "iso885914",
-    "latin9": "iso885915",
-    "latin10": "iso885916",
+  latin1: "iso88591",
+  latin2: "iso88592",
+  latin3: "iso88593",
+  latin4: "iso88594",
+  latin5: "iso88599",
+  latin6: "iso885910",
+  latin7: "iso885913",
+  latin8: "iso885914",
+  latin9: "iso885915",
+  latin10: "iso885916",
 
-    "csisolatin1": "iso88591",
-    "csisolatin2": "iso88592",
-    "csisolatin3": "iso88593",
-    "csisolatin4": "iso88594",
-    "csisolatincyrillic": "iso88595",
-    "csisolatinarabic": "iso88596",
-    "csisolatingreek" : "iso88597",
-    "csisolatinhebrew": "iso88598",
-    "csisolatin5": "iso88599",
-    "csisolatin6": "iso885910",
+  csisolatin1: "iso88591",
+  csisolatin2: "iso88592",
+  csisolatin3: "iso88593",
+  csisolatin4: "iso88594",
+  csisolatincyrillic: "iso88595",
+  csisolatinarabic: "iso88596",
+  csisolatingreek: "iso88597",
+  csisolatinhebrew: "iso88598",
+  csisolatin5: "iso88599",
+  csisolatin6: "iso885910",
 
-    "l1": "iso88591",
-    "l2": "iso88592",
-    "l3": "iso88593",
-    "l4": "iso88594",
-    "l5": "iso88599",
-    "l6": "iso885910",
-    "l7": "iso885913",
-    "l8": "iso885914",
-    "l9": "iso885915",
-    "l10": "iso885916",
+  l1: "iso88591",
+  l2: "iso88592",
+  l3: "iso88593",
+  l4: "iso88594",
+  l5: "iso88599",
+  l6: "iso885910",
+  l7: "iso885913",
+  l8: "iso885914",
+  l9: "iso885915",
+  l10: "iso885916",
 
-    "isoir14": "iso646jp",
-    "isoir57": "iso646cn",
-    "isoir100": "iso88591",
-    "isoir101": "iso88592",
-    "isoir109": "iso88593",
-    "isoir110": "iso88594",
-    "isoir144": "iso88595",
-    "isoir127": "iso88596",
-    "isoir126": "iso88597",
-    "isoir138": "iso88598",
-    "isoir148": "iso88599",
-    "isoir157": "iso885910",
-    "isoir166": "tis620",
-    "isoir179": "iso885913",
-    "isoir199": "iso885914",
-    "isoir203": "iso885915",
-    "isoir226": "iso885916",
+  isoir14: "iso646jp",
+  isoir57: "iso646cn",
+  isoir100: "iso88591",
+  isoir101: "iso88592",
+  isoir109: "iso88593",
+  isoir110: "iso88594",
+  isoir144: "iso88595",
+  isoir127: "iso88596",
+  isoir126: "iso88597",
+  isoir138: "iso88598",
+  isoir148: "iso88599",
+  isoir157: "iso885910",
+  isoir166: "tis620",
+  isoir179: "iso885913",
+  isoir199: "iso885914",
+  isoir203: "iso885915",
+  isoir226: "iso885916",
 
-    "cp819": "iso88591",
-    "ibm819": "iso88591",
+  cp819: "iso88591",
+  ibm819: "iso88591",
 
-    "cyrillic": "iso88595",
+  cyrillic: "iso88595",
 
-    "arabic": "iso88596",
-    "arabic8": "iso88596",
-    "ecma114": "iso88596",
-    "asmo708": "iso88596",
+  arabic: "iso88596",
+  arabic8: "iso88596",
+  ecma114: "iso88596",
+  asmo708: "iso88596",
 
-    "greek" : "iso88597",
-    "greek8" : "iso88597",
-    "ecma118" : "iso88597",
-    "elot928" : "iso88597",
+  greek: "iso88597",
+  greek8: "iso88597",
+  ecma118: "iso88597",
+  elot928: "iso88597",
 
-    "hebrew": "iso88598",
-    "hebrew8": "iso88598",
+  hebrew: "iso88598",
+  hebrew8: "iso88598",
+  iso88598i: "iso88598",
+  iso88598e: "iso88598",
 
-    "turkish": "iso88599",
-    "turkish8": "iso88599",
+  turkish: "iso88599",
+  turkish8: "iso88599",
 
-    "thai": "iso885911",
-    "thai8": "iso885911",
+  thai: "iso885911",
+  thai8: "iso885911",
 
-    "celtic": "iso885914",
-    "celtic8": "iso885914",
-    "isoceltic": "iso885914",
+  celtic: "iso885914",
+  celtic8: "iso885914",
+  isoceltic: "iso885914",
 
-    "tis6200": "tis620",
-    "tis62025291": "tis620",
-    "tis62025330": "tis620",
+  tis6200: "tis620",
+  tis62025291: "tis620",
+  tis62025330: "tis620",
 
-    "10000": "macroman",
-    "10006": "macgreek",
-    "10007": "maccyrillic",
-    "10079": "maciceland",
-    "10081": "macturkish",
+  10000: "macroman",
+  10006: "macgreek",
+  10007: "maccyrillic",
+  10079: "maciceland",
+  10081: "macturkish",
 
-    "cspc8codepage437": "cp437",
-    "cspc775baltic": "cp775",
-    "cspc850multilingual": "cp850",
-    "cspcp852": "cp852",
-    "cspc862latinhebrew": "cp862",
-    "cpgr": "cp869",
+  cspc8codepage437: "cp437",
+  cspc775baltic: "cp775",
+  cspc850multilingual: "cp850",
+  cspcp852: "cp852",
+  cspc862latinhebrew: "cp862",
+  cpgr: "cp869",
 
-    "msee": "cp1250",
-    "mscyrl": "cp1251",
-    "msansi": "cp1252",
-    "msgreek": "cp1253",
-    "msturk": "cp1254",
-    "mshebr": "cp1255",
-    "msarab": "cp1256",
-    "winbaltrim": "cp1257",
+  msee: "cp1250",
+  mscyrl: "cp1251",
+  msansi: "cp1252",
+  msgreek: "cp1253",
+  msturk: "cp1254",
+  mshebr: "cp1255",
+  msarab: "cp1256",
+  winbaltrim: "cp1257",
 
-    "cp20866": "koi8r",
-    "20866": "koi8r",
-    "ibm878": "koi8r",
-    "cskoi8r": "koi8r",
+  cp20866: "koi8r",
+  20866: "koi8r",
+  ibm878: "koi8r",
+  cskoi8r: "koi8r",
 
-    "cp21866": "koi8u",
-    "21866": "koi8u",
-    "ibm1168": "koi8u",
+  cp21866: "koi8u",
+  21866: "koi8u",
+  ibm1168: "koi8u",
 
-    "strk10482002": "rk1048",
+  strk10482002: "rk1048",
 
-    "tcvn5712": "tcvn",
-    "tcvn57121": "tcvn",
+  tcvn5712: "tcvn",
+  tcvn57121: "tcvn",
 
-    "gb198880": "iso646cn",
-    "cn": "iso646cn",
+  gb198880: "iso646cn",
+  cn: "iso646cn",
 
-    "csiso14jisc6220ro": "iso646jp",
-    "jisc62201969ro": "iso646jp",
-    "jp": "iso646jp",
+  csiso14jisc6220ro: "iso646jp",
+  jisc62201969ro: "iso646jp",
+  jp: "iso646jp",
 
-    "cshproman8": "hproman8",
-    "r8": "hproman8",
-    "roman8": "hproman8",
-    "xroman8": "hproman8",
-    "ibm1051": "hproman8",
+  cshproman8: "hproman8",
+  r8: "hproman8",
+  roman8: "hproman8",
+  xroman8: "hproman8",
+  ibm1051: "hproman8",
 
-    "mac": "macintosh",
-    "csmacintosh": "macintosh",
-};
-
+  mac: "macintosh",
+  csmacintosh: "macintosh"
+}
 
 
 /***/ }),
@@ -17460,70 +16385,67 @@ module.exports = {
 
 "use strict";
 
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
 // Note: UTF16-LE (or UCS2) codec is Node.js native. See encodings/internal.js
 
 // == UTF16-BE codec. ==========================================================
 
-exports.utf16be = Utf16BECodec;
-function Utf16BECodec() {
+exports.utf16be = Utf16BECodec
+function Utf16BECodec () {
 }
 
-Utf16BECodec.prototype.encoder = Utf16BEEncoder;
-Utf16BECodec.prototype.decoder = Utf16BEDecoder;
-Utf16BECodec.prototype.bomAware = true;
-
+Utf16BECodec.prototype.encoder = Utf16BEEncoder
+Utf16BECodec.prototype.decoder = Utf16BEDecoder
+Utf16BECodec.prototype.bomAware = true
 
 // -- Encoding
 
-function Utf16BEEncoder() {
+function Utf16BEEncoder () {
 }
 
-Utf16BEEncoder.prototype.write = function(str) {
-    var buf = Buffer.from(str, 'ucs2');
-    for (var i = 0; i < buf.length; i += 2) {
-        var tmp = buf[i]; buf[i] = buf[i+1]; buf[i+1] = tmp;
-    }
-    return buf;
+Utf16BEEncoder.prototype.write = function (str) {
+  var buf = Buffer.from(str, "ucs2")
+  for (var i = 0; i < buf.length; i += 2) {
+    var tmp = buf[i]; buf[i] = buf[i + 1]; buf[i + 1] = tmp
+  }
+  return buf
 }
 
-Utf16BEEncoder.prototype.end = function() {
+Utf16BEEncoder.prototype.end = function () {
 }
-
 
 // -- Decoding
 
-function Utf16BEDecoder() {
-    this.overflowByte = -1;
+function Utf16BEDecoder () {
+  this.overflowByte = -1
 }
 
-Utf16BEDecoder.prototype.write = function(buf) {
-    if (buf.length == 0)
-        return '';
+Utf16BEDecoder.prototype.write = function (buf) {
+  if (buf.length == 0) { return "" }
 
-    var buf2 = Buffer.alloc(buf.length + 1),
-        i = 0, j = 0;
+  var buf2 = Buffer.alloc(buf.length + 1)
+  var i = 0; var j = 0
 
-    if (this.overflowByte !== -1) {
-        buf2[0] = buf[0];
-        buf2[1] = this.overflowByte;
-        i = 1; j = 2;
-    }
+  if (this.overflowByte !== -1) {
+    buf2[0] = buf[0]
+    buf2[1] = this.overflowByte
+    i = 1; j = 2
+  }
 
-    for (; i < buf.length-1; i += 2, j+= 2) {
-        buf2[j] = buf[i+1];
-        buf2[j+1] = buf[i];
-    }
+  for (; i < buf.length - 1; i += 2, j += 2) {
+    buf2[j] = buf[i + 1]
+    buf2[j + 1] = buf[i]
+  }
 
-    this.overflowByte = (i == buf.length-1) ? buf[buf.length-1] : -1;
+  this.overflowByte = (i == buf.length - 1) ? buf[buf.length - 1] : -1
 
-    return buf2.slice(0, j).toString('ucs2');
+  return buf2.slice(0, j).toString("ucs2")
 }
 
-Utf16BEDecoder.prototype.end = function() {
+Utf16BEDecoder.prototype.end = function () {
+  this.overflowByte = -1
 }
-
 
 // == UTF-16 codec =============================================================
 // Decoder chooses automatically from UTF-16LE and UTF-16BE using BOM and space-based heuristic.
@@ -17533,109 +16455,122 @@ Utf16BEDecoder.prototype.end = function() {
 
 // Encoder uses UTF-16LE and prepends BOM (which can be overridden with addBOM: false).
 
-exports.utf16 = Utf16Codec;
-function Utf16Codec(codecOptions, iconv) {
-    this.iconv = iconv;
+exports.utf16 = Utf16Codec
+function Utf16Codec (codecOptions, iconv) {
+  this.iconv = iconv
 }
 
-Utf16Codec.prototype.encoder = Utf16Encoder;
-Utf16Codec.prototype.decoder = Utf16Decoder;
-
+Utf16Codec.prototype.encoder = Utf16Encoder
+Utf16Codec.prototype.decoder = Utf16Decoder
 
 // -- Encoding (pass-through)
 
-function Utf16Encoder(options, codec) {
-    options = options || {};
-    if (options.addBOM === undefined)
-        options.addBOM = true;
-    this.encoder = codec.iconv.getEncoder('utf-16le', options);
+function Utf16Encoder (options, codec) {
+  options = options || {}
+  if (options.addBOM === undefined) { options.addBOM = true }
+  this.encoder = codec.iconv.getEncoder("utf-16le", options)
 }
 
-Utf16Encoder.prototype.write = function(str) {
-    return this.encoder.write(str);
+Utf16Encoder.prototype.write = function (str) {
+  return this.encoder.write(str)
 }
 
-Utf16Encoder.prototype.end = function() {
-    return this.encoder.end();
+Utf16Encoder.prototype.end = function () {
+  return this.encoder.end()
 }
-
 
 // -- Decoding
 
-function Utf16Decoder(options, codec) {
-    this.decoder = null;
-    this.initialBytes = [];
-    this.initialBytesLen = 0;
+function Utf16Decoder (options, codec) {
+  this.decoder = null
+  this.initialBufs = []
+  this.initialBufsLen = 0
 
-    this.options = options || {};
-    this.iconv = codec.iconv;
+  this.options = options || {}
+  this.iconv = codec.iconv
 }
 
-Utf16Decoder.prototype.write = function(buf) {
-    if (!this.decoder) {
-        // Codec is not chosen yet. Accumulate initial bytes.
-        this.initialBytes.push(buf);
-        this.initialBytesLen += buf.length;
-        
-        if (this.initialBytesLen < 16) // We need more bytes to use space heuristic (see below)
-            return '';
+Utf16Decoder.prototype.write = function (buf) {
+  if (!this.decoder) {
+    // Codec is not chosen yet. Accumulate initial bytes.
+    this.initialBufs.push(buf)
+    this.initialBufsLen += buf.length
 
-        // We have enough bytes -> detect endianness.
-        var buf = Buffer.concat(this.initialBytes),
-            encoding = detectEncoding(buf, this.options.defaultEncoding);
-        this.decoder = this.iconv.getDecoder(encoding, this.options);
-        this.initialBytes.length = this.initialBytesLen = 0;
-    }
+    if (this.initialBufsLen < 16) // We need more bytes to use space heuristic (see below)
+    { return "" }
 
-    return this.decoder.write(buf);
+    // We have enough bytes -> detect endianness.
+    var encoding = detectEncoding(this.initialBufs, this.options.defaultEncoding)
+    this.decoder = this.iconv.getDecoder(encoding, this.options)
+
+    var resStr = ""
+    for (var i = 0; i < this.initialBufs.length; i++) { resStr += this.decoder.write(this.initialBufs[i]) }
+
+    this.initialBufs.length = this.initialBufsLen = 0
+    return resStr
+  }
+
+  return this.decoder.write(buf)
 }
 
-Utf16Decoder.prototype.end = function() {
-    if (!this.decoder) {
-        var buf = Buffer.concat(this.initialBytes),
-            encoding = detectEncoding(buf, this.options.defaultEncoding);
-        this.decoder = this.iconv.getDecoder(encoding, this.options);
+Utf16Decoder.prototype.end = function () {
+  if (!this.decoder) {
+    var encoding = detectEncoding(this.initialBufs, this.options.defaultEncoding)
+    this.decoder = this.iconv.getDecoder(encoding, this.options)
 
-        var res = this.decoder.write(buf),
-            trail = this.decoder.end();
+    var resStr = ""
+    for (var i = 0; i < this.initialBufs.length; i++) { resStr += this.decoder.write(this.initialBufs[i]) }
 
-        return trail ? (res + trail) : res;
-    }
-    return this.decoder.end();
+    var trail = this.decoder.end()
+    if (trail) { resStr += trail }
+
+    this.initialBufs.length = this.initialBufsLen = 0
+    return resStr
+  }
+  return this.decoder.end()
 }
 
-function detectEncoding(buf, defaultEncoding) {
-    var enc = defaultEncoding || 'utf-16le';
+function detectEncoding (bufs, defaultEncoding) {
+  var b = []
+  var charsProcessed = 0
+  // Number of ASCII chars when decoded as LE or BE.
+  var asciiCharsLE = 0
+  var asciiCharsBE = 0
 
-    if (buf.length >= 2) {
-        // Check BOM.
-        if (buf[0] == 0xFE && buf[1] == 0xFF) // UTF-16BE BOM
-            enc = 'utf-16be';
-        else if (buf[0] == 0xFF && buf[1] == 0xFE) // UTF-16LE BOM
-            enc = 'utf-16le';
-        else {
-            // No BOM found. Try to deduce encoding from initial content.
-            // Most of the time, the content has ASCII chars (U+00**), but the opposite (U+**00) is uncommon.
-            // So, we count ASCII as if it was LE or BE, and decide from that.
-            var asciiCharsLE = 0, asciiCharsBE = 0, // Counts of chars in both positions
-                _len = Math.min(buf.length - (buf.length % 2), 64); // Len is always even.
-
-            for (var i = 0; i < _len; i += 2) {
-                if (buf[i] === 0 && buf[i+1] !== 0) asciiCharsBE++;
-                if (buf[i] !== 0 && buf[i+1] === 0) asciiCharsLE++;
-            }
-
-            if (asciiCharsBE > asciiCharsLE)
-                enc = 'utf-16be';
-            else if (asciiCharsBE < asciiCharsLE)
-                enc = 'utf-16le';
+  outerLoop:
+  for (var i = 0; i < bufs.length; i++) {
+    var buf = bufs[i]
+    for (var j = 0; j < buf.length; j++) {
+      b.push(buf[j])
+      if (b.length === 2) {
+        if (charsProcessed === 0) {
+          // Check BOM first.
+          if (b[0] === 0xFF && b[1] === 0xFE) return "utf-16le"
+          if (b[0] === 0xFE && b[1] === 0xFF) return "utf-16be"
         }
+
+        if (b[0] === 0 && b[1] !== 0) asciiCharsBE++
+        if (b[0] !== 0 && b[1] === 0) asciiCharsLE++
+
+        b.length = 0
+        charsProcessed++
+
+        if (charsProcessed >= 100) {
+          break outerLoop
+        }
+      }
     }
+  }
 
-    return enc;
+  // Make decisions.
+  // Most of the time, the content has ASCII chars (U+00**), but the opposite (U+**00) is uncommon.
+  // So, we count ASCII as if it was LE or BE, and decide from that.
+  if (asciiCharsBE > asciiCharsLE) return "utf-16be"
+  if (asciiCharsBE < asciiCharsLE) return "utf-16le"
+
+  // Couldn't decide (likely all zeros or not enough data).
+  return defaultEncoding || "utf-16le"
 }
-
-
 
 
 /***/ }),
@@ -17646,161 +16581,184 @@ function detectEncoding(buf, defaultEncoding) {
 "use strict";
 
 
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
 // == UTF32-LE/BE codec. ==========================================================
 
-exports._utf32 = Utf32Codec;
+exports._utf32 = Utf32Codec
 
-function Utf32Codec(codecOptions, iconv) {
-    this.iconv = iconv;
-    this.bomAware = true;
-    this.isLE = codecOptions.isLE;
+function Utf32Codec (codecOptions, iconv) {
+  this.iconv = iconv
+  this.bomAware = true
+  this.isLE = codecOptions.isLE
 }
 
-exports.utf32le = { type: '_utf32', isLE: true };
-exports.utf32be = { type: '_utf32', isLE: false };
+exports.utf32le = { type: "_utf32", isLE: true }
+exports.utf32be = { type: "_utf32", isLE: false }
 
 // Aliases
-exports.ucs4le = 'utf32le';
-exports.ucs4be = 'utf32be';
+exports.ucs4le = "utf32le"
+exports.ucs4be = "utf32be"
 
-Utf32Codec.prototype.encoder = Utf32Encoder;
-Utf32Codec.prototype.decoder = Utf32Decoder;
+Utf32Codec.prototype.encoder = Utf32Encoder
+Utf32Codec.prototype.decoder = Utf32Decoder
 
 // -- Encoding
 
-function Utf32Encoder(options, codec) {
-    this.isLE = codec.isLE;
-    this.highSurrogate = 0;
+function Utf32Encoder (options, codec) {
+  this.isLE = codec.isLE
+  this.highSurrogate = 0
 }
 
-Utf32Encoder.prototype.write = function(str) {
-    var src = Buffer.from(str, 'ucs2');
-    var dst = Buffer.alloc(src.length * 2);
-    var write32 = this.isLE ? dst.writeUInt32LE : dst.writeUInt32BE;
-    var offset = 0;
+Utf32Encoder.prototype.write = function (str) {
+  var src = Buffer.from(str, "ucs2")
+  // src.length * 2 covers this chunk's code units (4 bytes each); the extra 4 bytes leave room for a
+  // high surrogate held over from a previous chunk, which is flushed ahead of this chunk's units.
+  var dst = Buffer.alloc(src.length * 2 + 4)
+  var write32 = this.isLE ? dst.writeUInt32LE : dst.writeUInt32BE
+  var offset = 0
 
-    for (var i = 0; i < src.length; i += 2) {
-        var code = src.readUInt16LE(i);
-        var isHighSurrogate = (0xD800 <= code && code < 0xDC00);
-        var isLowSurrogate = (0xDC00 <= code && code < 0xE000);
+  for (var i = 0; i < src.length; i += 2) {
+    var code = src.readUInt16LE(i)
+    var isHighSurrogate = (code >= 0xD800 && code < 0xDC00)
+    var isLowSurrogate = (code >= 0xDC00 && code < 0xE000)
 
-        if (this.highSurrogate) {
-            if (isHighSurrogate || !isLowSurrogate) {
-                // There shouldn't be two high surrogates in a row, nor a high surrogate which isn't followed by a low
-                // surrogate. If this happens, keep the pending high surrogate as a stand-alone semi-invalid character
-                // (technically wrong, but expected by some applications, like Windows file names).
-                write32.call(dst, this.highSurrogate, offset);
-                offset += 4;
-            }
-            else {
-                // Create 32-bit value from high and low surrogates;
-                var codepoint = (((this.highSurrogate - 0xD800) << 10) | (code - 0xDC00)) + 0x10000;
+    if (this.highSurrogate) {
+      if (isHighSurrogate || !isLowSurrogate) {
+        // There shouldn't be two high surrogates in a row, nor a high surrogate which isn't followed by a low
+        // surrogate. If this happens, keep the pending high surrogate as a stand-alone semi-invalid character
+        // (technically wrong, but expected by some applications, like Windows file names).
+        write32.call(dst, this.highSurrogate, offset)
+        offset += 4
+      } else {
+        // Create 32-bit value from high and low surrogates;
+        var codepoint = (((this.highSurrogate - 0xD800) << 10) | (code - 0xDC00)) + 0x10000
 
-                write32.call(dst, codepoint, offset);
-                offset += 4;
-                this.highSurrogate = 0;
+        write32.call(dst, codepoint, offset)
+        offset += 4
+        this.highSurrogate = 0
 
-                continue;
-            }
-        }
-
-        if (isHighSurrogate)
-            this.highSurrogate = code;
-        else {
-            // Even if the current character is a low surrogate, with no previous high surrogate, we'll
-            // encode it as a semi-invalid stand-alone character for the same reasons expressed above for
-            // unpaired high surrogates.
-            write32.call(dst, code, offset);
-            offset += 4;
-            this.highSurrogate = 0;
-        }
+        continue
+      }
     }
 
-    if (offset < dst.length)
-        dst = dst.slice(0, offset);
+    if (isHighSurrogate) { this.highSurrogate = code } else {
+      // Even if the current character is a low surrogate, with no previous high surrogate, we'll
+      // encode it as a semi-invalid stand-alone character for the same reasons expressed above for
+      // unpaired high surrogates.
+      write32.call(dst, code, offset)
+      offset += 4
+      this.highSurrogate = 0
+    }
+  }
 
-    return dst;
-};
+  if (offset < dst.length) { dst = dst.slice(0, offset) }
 
-Utf32Encoder.prototype.end = function() {
-    // Treat any leftover high surrogate as a semi-valid independent character.
-    if (!this.highSurrogate)
-        return;
+  return dst
+}
 
-    var buf = Buffer.alloc(4);
+Utf32Encoder.prototype.end = function () {
+  // Treat any leftover high surrogate as a semi-valid independent character.
+  if (!this.highSurrogate) { return }
 
-    if (this.isLE)
-        buf.writeUInt32LE(this.highSurrogate, 0);
-    else
-        buf.writeUInt32BE(this.highSurrogate, 0);
+  var buf = Buffer.alloc(4)
 
-    this.highSurrogate = 0;
+  if (this.isLE) { buf.writeUInt32LE(this.highSurrogate, 0) } else { buf.writeUInt32BE(this.highSurrogate, 0) }
 
-    return buf;
-};
+  this.highSurrogate = 0
+
+  return buf
+}
 
 // -- Decoding
 
-function Utf32Decoder(options, codec) {
-    this.isLE = codec.isLE;
-    this.badChar = codec.iconv.defaultCharUnicode.charCodeAt(0);
-    this.overflow = null;
+function Utf32Decoder (options, codec) {
+  this.isLE = codec.isLE
+  this.badChar = codec.iconv.defaultCharUnicode.charCodeAt(0)
+  this.overflow = []
 }
 
-Utf32Decoder.prototype.write = function(src) {
-    if (src.length === 0)
-        return '';
+Utf32Decoder.prototype.write = function (src) {
+  if (src.length === 0) { return "" }
 
-    if (this.overflow)
-        src = Buffer.concat([this.overflow, src]);
+  var i = 0
+  var codepoint = 0
+  var dst = Buffer.alloc(src.length + 4)
+  var offset = 0
+  var isLE = this.isLE
+  var overflow = this.overflow
+  var badChar = this.badChar
 
-    var goodLength = src.length - src.length % 4;
+  if (overflow.length > 0) {
+    for (; i < src.length && overflow.length < 4; i++) { overflow.push(src[i]) }
 
-    if (src.length !== goodLength) {
-        this.overflow = src.slice(goodLength);
-        src = src.slice(0, goodLength);
+    if (overflow.length === 4) {
+      // NOTE: codepoint is a signed int32 and can be negative.
+      // NOTE: We copied this block from below to help V8 optimize it (it works with array, not buffer).
+      if (isLE) {
+        codepoint = overflow[0] | (overflow[1] << 8) | (overflow[2] << 16) | (overflow[3] << 24)
+      } else {
+        codepoint = overflow[3] | (overflow[2] << 8) | (overflow[1] << 16) | (overflow[0] << 24)
+      }
+      overflow.length = 0
+
+      offset = _writeCodepoint(dst, offset, codepoint, badChar)
     }
-    else
-        this.overflow = null;
+  }
 
-    var dst = Buffer.alloc(goodLength);
-    var offset = 0;
-
-    for (var i = 0; i < goodLength; i += 4) {
-        var codepoint = this.isLE ? src.readUInt32LE(i) : src.readUInt32BE(i);
-
-        if (codepoint < 0x10000) {
-            // Simple 16-bit character
-            dst.writeUInt16LE(codepoint, offset);
-            offset += 2;
-        }
-        else {
-            if (codepoint > 0x10FFFF) {
-                // Not a valid Unicode codepoint
-                dst.writeUInt16LE(this.badChar, offset);
-                offset += 2;
-            }
-            else {
-                // Create high and low surrogates.
-                codepoint -= 0x10000;
-                var high = 0xD800 | (codepoint >> 10);
-                var low = 0xDC00 + (codepoint & 0x3FF);
-                dst.writeUInt16LE(high, offset);
-                offset += 2;
-                dst.writeUInt16LE(low, offset);
-                offset += 2;
-            }
-        }
+  // Main loop. Should be as optimized as possible.
+  for (; i < src.length - 3; i += 4) {
+    // NOTE: codepoint is a signed int32 and can be negative.
+    if (isLE) {
+      codepoint = src[i] | (src[i + 1] << 8) | (src[i + 2] << 16) | (src[i + 3] << 24)
+    } else {
+      codepoint = src[i + 3] | (src[i + 2] << 8) | (src[i + 1] << 16) | (src[i] << 24)
     }
+    offset = _writeCodepoint(dst, offset, codepoint, badChar)
+  }
 
-    return dst.slice(0, offset).toString('ucs2');
+  // Keep overflowing bytes.
+  for (; i < src.length; i++) {
+    overflow.push(src[i])
+  }
+
+  return dst.slice(0, offset).toString("ucs2")
+}
+
+function _writeCodepoint (dst, offset, codepoint, badChar) {
+  // NOTE: codepoint is signed int32 and can be negative. We keep it that way to help V8 with optimizations.
+  if (codepoint < 0 || codepoint > 0x10FFFF) {
+    // Not a valid Unicode codepoint
+    codepoint = badChar
+  }
+
+  // Ephemeral Planes: Write high surrogate.
+  if (codepoint >= 0x10000) {
+    codepoint -= 0x10000
+
+    var high = 0xD800 | (codepoint >> 10)
+    dst[offset++] = high & 0xff
+    dst[offset++] = high >> 8
+
+    // Low surrogate is written below.
+    var codepoint = 0xDC00 | (codepoint & 0x3FF)
+  }
+
+  // Write BMP char or low surrogate.
+  dst[offset++] = codepoint & 0xff
+  dst[offset++] = codepoint >> 8
+
+  return offset
 };
 
-Utf32Decoder.prototype.end = function() {
-    this.overflow = null;
-};
+Utf32Decoder.prototype.end = function () {
+  if (this.overflow.length === 0) { return }
+
+  // A leftover, incomplete 4-byte code unit at the end of the input is ill-formed. Substitute a
+  // single U+FFFD (Unicode Standard conformance clause C10) instead of silently dropping the bytes.
+  this.overflow.length = 0
+  return String.fromCharCode(this.badChar)
+}
 
 // == UTF-32 Auto codec =============================================================
 // Decoder chooses automatically from UTF-32LE and UTF-32BE using BOM and space-based heuristic.
@@ -17809,121 +16767,131 @@ Utf32Decoder.prototype.end = function() {
 
 // Encoder prepends BOM (which can be overridden with (addBOM: false}).
 
-exports.utf32 = Utf32AutoCodec;
-exports.ucs4 = Utf32AutoCodec;
+exports.utf32 = Utf32AutoCodec
+exports.ucs4 = "utf32"
 
-function Utf32AutoCodec(options, iconv) {
-    this.iconv = iconv;
+function Utf32AutoCodec (options, iconv) {
+  this.iconv = iconv
 }
 
-Utf32AutoCodec.prototype.encoder = Utf32AutoEncoder;
-Utf32AutoCodec.prototype.decoder = Utf32AutoDecoder;
+Utf32AutoCodec.prototype.encoder = Utf32AutoEncoder
+Utf32AutoCodec.prototype.decoder = Utf32AutoDecoder
 
 // -- Encoding
 
-function Utf32AutoEncoder(options, codec) {
-    options = options || {};
+function Utf32AutoEncoder (options, codec) {
+  options = options || {}
 
-    if (options.addBOM === undefined)
-        options.addBOM = true;
+  if (options.addBOM === undefined) {
+    options.addBOM = true
+  }
 
-    this.encoder = codec.iconv.getEncoder(options.defaultEncoding || 'utf-32le', options);
+  this.encoder = codec.iconv.getEncoder(options.defaultEncoding || "utf-32le", options)
 }
 
-Utf32AutoEncoder.prototype.write = function(str) {
-    return this.encoder.write(str);
-};
+Utf32AutoEncoder.prototype.write = function (str) {
+  return this.encoder.write(str)
+}
 
-Utf32AutoEncoder.prototype.end = function() {
-    return this.encoder.end();
-};
+Utf32AutoEncoder.prototype.end = function () {
+  return this.encoder.end()
+}
 
 // -- Decoding
 
-function Utf32AutoDecoder(options, codec) {
-    this.decoder = null;
-    this.initialBytes = [];
-    this.initialBytesLen = 0;
-    this.options = options || {};
-    this.iconv = codec.iconv;
+function Utf32AutoDecoder (options, codec) {
+  this.decoder = null
+  this.initialBufs = []
+  this.initialBufsLen = 0
+  this.options = options || {}
+  this.iconv = codec.iconv
 }
 
-Utf32AutoDecoder.prototype.write = function(buf) {
-    if (!this.decoder) {
-        // Codec is not chosen yet. Accumulate initial bytes.
-        this.initialBytes.push(buf);
-        this.initialBytesLen += buf.length;
+Utf32AutoDecoder.prototype.write = function (buf) {
+  if (!this.decoder) {
+    // Codec is not chosen yet. Accumulate initial bytes.
+    this.initialBufs.push(buf)
+    this.initialBufsLen += buf.length
 
-        if (this.initialBytesLen < 32) // We need more bytes to use space heuristic (see below)
-            return '';
+    if (this.initialBufsLen < 32) // We need more bytes to use space heuristic (see below)
+    { return "" }
 
-        // We have enough bytes -> detect endianness.
-        var buf2 = Buffer.concat(this.initialBytes),
-            encoding = detectEncoding(buf2, this.options.defaultEncoding);
-        this.decoder = this.iconv.getDecoder(encoding, this.options);
-        this.initialBytes.length = this.initialBytesLen = 0;
-    }
+    // We have enough bytes -> detect endianness.
+    var encoding = detectEncoding(this.initialBufs, this.options.defaultEncoding)
+    this.decoder = this.iconv.getDecoder(encoding, this.options)
 
-    return this.decoder.write(buf);
-};
+    var resStr = ""
+    for (var i = 0; i < this.initialBufs.length; i++) { resStr += this.decoder.write(this.initialBufs[i]) }
 
-Utf32AutoDecoder.prototype.end = function() {
-    if (!this.decoder) {
-        var buf = Buffer.concat(this.initialBytes),
-            encoding = detectEncoding(buf, this.options.defaultEncoding);
-        this.decoder = this.iconv.getDecoder(encoding, this.options);
+    this.initialBufs.length = this.initialBufsLen = 0
+    return resStr
+  }
 
-        var res = this.decoder.write(buf),
-            trail = this.decoder.end();
+  return this.decoder.write(buf)
+}
 
-        return trail ? (res + trail) : res;
-    }
+Utf32AutoDecoder.prototype.end = function () {
+  if (!this.decoder) {
+    var encoding = detectEncoding(this.initialBufs, this.options.defaultEncoding)
+    this.decoder = this.iconv.getDecoder(encoding, this.options)
 
-    return this.decoder.end();
-};
+    var resStr = ""
+    for (var i = 0; i < this.initialBufs.length; i++) { resStr += this.decoder.write(this.initialBufs[i]) }
 
-function detectEncoding(buf, defaultEncoding) {
-    var enc = defaultEncoding || 'utf-32le';
+    var trail = this.decoder.end()
+    if (trail) { resStr += trail }
 
-    if (buf.length >= 4) {
-        // Check BOM.
-        if (buf.readUInt32BE(0) === 0xFEFF) // UTF-32LE BOM
-            enc = 'utf-32be';
-        else if (buf.readUInt32LE(0) === 0xFEFF) // UTF-32LE BOM
-            enc = 'utf-32le';
-        else {
-            // No BOM found. Try to deduce encoding from initial content.
-            // Using the wrong endian-ism for UTF-32 will very often result in codepoints that are beyond
-            // the valid Unicode limit of 0x10FFFF. That will be used as the primary determinant.
-            //
-            // Further, we can suppose the content is mostly plain ASCII chars (U+00**).
-            // So, we count ASCII as if it was LE or BE, and decide from that.
-            var invalidLE = 0, invalidBE = 0;
-            var asciiCharsLE = 0, asciiCharsBE = 0, // Counts of chars in both positions
-                _len = Math.min(buf.length - (buf.length % 4), 128); // Len is always even.
+    this.initialBufs.length = this.initialBufsLen = 0
+    return resStr
+  }
 
-            for (var i = 0; i < _len; i += 4) {
-                var b0 = buf[i], b1  = buf[i + 1], b2 = buf[i + 2], b3 = buf[i + 3];
+  return this.decoder.end()
+}
 
-                if (b0 !== 0 || b1 > 0x10) ++invalidBE;
-                if (b3 !== 0 || b2 > 0x10) ++invalidLE;
+function detectEncoding (bufs, defaultEncoding) {
+  var b = []
+  var charsProcessed = 0
+  var invalidLE = 0; var invalidBE = 0   // Number of invalid chars when decoded as LE or BE.
+  var bmpCharsLE = 0; var bmpCharsBE = 0 // Number of BMP chars when decoded as LE or BE.
 
-                if (b0 === 0 && b1 === 0 && b2 === 0 && b3 !== 0) asciiCharsBE++;
-                if (b0 !== 0 && b1 === 0 && b2 === 0 && b3 === 0) asciiCharsLE++;
-            }
-
-            if (invalidBE < invalidLE)
-                enc = 'utf-32be';
-            else if (invalidLE < invalidBE)
-                enc = 'utf-32le';
-            if (asciiCharsBE > asciiCharsLE)
-                enc = 'utf-32be';
-            else if (asciiCharsBE < asciiCharsLE)
-                enc = 'utf-32le';
+  outerLoop:
+  for (var i = 0; i < bufs.length; i++) {
+    var buf = bufs[i]
+    for (var j = 0; j < buf.length; j++) {
+      b.push(buf[j])
+      if (b.length === 4) {
+        if (charsProcessed === 0) {
+          // Check BOM first.
+          if (b[0] === 0xFF && b[1] === 0xFE && b[2] === 0 && b[3] === 0) {
+            return "utf-32le"
+          }
+          if (b[0] === 0 && b[1] === 0 && b[2] === 0xFE && b[3] === 0xFF) {
+            return "utf-32be"
+          }
         }
-    }
 
-    return enc;
+        if (b[0] !== 0 || b[1] > 0x10) invalidBE++
+        if (b[3] !== 0 || b[2] > 0x10) invalidLE++
+
+        if (b[0] === 0 && b[1] === 0 && (b[2] !== 0 || b[3] !== 0)) bmpCharsBE++
+        if ((b[0] !== 0 || b[1] !== 0) && b[2] === 0 && b[3] === 0) bmpCharsLE++
+
+        b.length = 0
+        charsProcessed++
+
+        if (charsProcessed >= 100) {
+          break outerLoop
+        }
+      }
+    }
+  }
+
+  // Make decisions.
+  if (bmpCharsBE - invalidBE > bmpCharsLE - invalidLE) return "utf-32be"
+  if (bmpCharsBE - invalidBE < bmpCharsLE - invalidLE) return "utf-32le"
+
+  // Couldn't decide (likely all zeros or not enough data).
+  return defaultEncoding || "utf-32le"
 }
 
 
@@ -17934,123 +16902,123 @@ function detectEncoding(buf, defaultEncoding) {
 
 "use strict";
 
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
 // UTF-7 codec, according to https://tools.ietf.org/html/rfc2152
 // See also below a UTF-7-IMAP codec, according to http://tools.ietf.org/html/rfc3501#section-5.1.3
 
-exports.utf7 = Utf7Codec;
-exports.unicode11utf7 = 'utf7'; // Alias UNICODE-1-1-UTF-7
-function Utf7Codec(codecOptions, iconv) {
-    this.iconv = iconv;
+exports.utf7 = Utf7Codec
+exports.unicode11utf7 = "utf7" // Alias UNICODE-1-1-UTF-7
+function Utf7Codec (codecOptions, iconv) {
+  this.iconv = iconv
 };
 
-Utf7Codec.prototype.encoder = Utf7Encoder;
-Utf7Codec.prototype.decoder = Utf7Decoder;
-Utf7Codec.prototype.bomAware = true;
-
+Utf7Codec.prototype.encoder = Utf7Encoder
+Utf7Codec.prototype.decoder = Utf7Decoder
+Utf7Codec.prototype.bomAware = true
 
 // -- Encoding
 
-var nonDirectChars = /[^A-Za-z0-9'\(\),-\.\/:\? \n\r\t]+/g;
+// Why scape ()?./?
+// eslint-disable-next-line no-useless-escape
+var nonDirectChars = /[^A-Za-z0-9'\(\),-\.\/:\? \n\r\t]+/g
 
-function Utf7Encoder(options, codec) {
-    this.iconv = codec.iconv;
+function Utf7Encoder (options, codec) {
+  this.iconv = codec.iconv
 }
 
-Utf7Encoder.prototype.write = function(str) {
-    // Naive implementation.
-    // Non-direct chars are encoded as "+<base64>-"; single "+" char is encoded as "+-".
-    return Buffer.from(str.replace(nonDirectChars, function(chunk) {
-        return "+" + (chunk === '+' ? '' : 
-            this.iconv.encode(chunk, 'utf16-be').toString('base64').replace(/=+$/, '')) 
-            + "-";
-    }.bind(this)));
+Utf7Encoder.prototype.write = function (str) {
+  // Naive implementation.
+  // Non-direct chars are encoded as "+<base64>-"; single "+" char is encoded as "+-".
+  return Buffer.from(str.replace(nonDirectChars, function (chunk) {
+    return "+" + (chunk === "+"
+      ? ""
+      : this.iconv.encode(chunk, "utf16-be").toString("base64").replace(/=+$/, "")) +
+            "-"
+  }.bind(this)))
 }
 
-Utf7Encoder.prototype.end = function() {
+Utf7Encoder.prototype.end = function () {
 }
-
 
 // -- Decoding
 
-function Utf7Decoder(options, codec) {
-    this.iconv = codec.iconv;
-    this.inBase64 = false;
-    this.base64Accum = '';
+function Utf7Decoder (options, codec) {
+  this.iconv = codec.iconv
+  this.inBase64 = false
+  this.base64Accum = ""
 }
 
-var base64Regex = /[A-Za-z0-9\/+]/;
-var base64Chars = [];
-for (var i = 0; i < 256; i++)
-    base64Chars[i] = base64Regex.test(String.fromCharCode(i));
+// Why scape /?
+// eslint-disable-next-line no-useless-escape
+var base64Regex = /[A-Za-z0-9\/+]/
+var base64Chars = []
+for (var i = 0; i < 256; i++) { base64Chars[i] = base64Regex.test(String.fromCharCode(i)) }
 
-var plusChar = '+'.charCodeAt(0), 
-    minusChar = '-'.charCodeAt(0),
-    andChar = '&'.charCodeAt(0);
+var plusChar = "+".charCodeAt(0)
+var minusChar = "-".charCodeAt(0)
+var andChar = "&".charCodeAt(0)
 
-Utf7Decoder.prototype.write = function(buf) {
-    var res = "", lastI = 0,
-        inBase64 = this.inBase64,
-        base64Accum = this.base64Accum;
+Utf7Decoder.prototype.write = function (buf) {
+  var res = ""; var lastI = 0
+  var inBase64 = this.inBase64
+  var base64Accum = this.base64Accum
 
-    // The decoder is more involved as we must handle chunks in stream.
+  // The decoder is more involved as we must handle chunks in stream.
 
-    for (var i = 0; i < buf.length; i++) {
-        if (!inBase64) { // We're in direct mode.
-            // Write direct chars until '+'
-            if (buf[i] == plusChar) {
-                res += this.iconv.decode(buf.slice(lastI, i), "ascii"); // Write direct chars.
-                lastI = i+1;
-                inBase64 = true;
-            }
-        } else { // We decode base64.
-            if (!base64Chars[buf[i]]) { // Base64 ended.
-                if (i == lastI && buf[i] == minusChar) {// "+-" -> "+"
-                    res += "+";
-                } else {
-                    var b64str = base64Accum + buf.slice(lastI, i).toString();
-                    res += this.iconv.decode(Buffer.from(b64str, 'base64'), "utf16-be");
-                }
-
-                if (buf[i] != minusChar) // Minus is absorbed after base64.
-                    i--;
-
-                lastI = i+1;
-                inBase64 = false;
-                base64Accum = '';
-            }
+  for (var i = 0; i < buf.length; i++) {
+    if (!inBase64) { // We're in direct mode.
+      // Write direct chars until '+'
+      if (buf[i] == plusChar) {
+        res += this.iconv.decode(buf.slice(lastI, i), "ascii") // Write direct chars.
+        lastI = i + 1
+        inBase64 = true
+      }
+    } else { // We decode base64.
+      if (!base64Chars[buf[i]]) { // Base64 ended.
+        if (i == lastI && buf[i] == minusChar) { // "+-" -> "+"
+          res += "+"
+        } else {
+          var b64str = base64Accum + this.iconv.decode(buf.slice(lastI, i), "ascii")
+          res += this.iconv.decode(Buffer.from(b64str, "base64"), "utf16-be")
         }
+
+        if (buf[i] != minusChar) // Minus is absorbed after base64.
+        { i-- }
+
+        lastI = i + 1
+        inBase64 = false
+        base64Accum = ""
+      }
     }
+  }
 
-    if (!inBase64) {
-        res += this.iconv.decode(buf.slice(lastI), "ascii"); // Write direct chars.
-    } else {
-        var b64str = base64Accum + buf.slice(lastI).toString();
+  if (!inBase64) {
+    res += this.iconv.decode(buf.slice(lastI), "ascii") // Write direct chars.
+  } else {
+    var b64str = base64Accum + this.iconv.decode(buf.slice(lastI), "ascii")
 
-        var canBeDecoded = b64str.length - (b64str.length % 8); // Minimal chunk: 2 quads -> 2x3 bytes -> 3 chars.
-        base64Accum = b64str.slice(canBeDecoded); // The rest will be decoded in future.
-        b64str = b64str.slice(0, canBeDecoded);
+    var canBeDecoded = b64str.length - (b64str.length % 8) // Minimal chunk: 2 quads -> 2x3 bytes -> 3 chars.
+    base64Accum = b64str.slice(canBeDecoded) // The rest will be decoded in future.
+    b64str = b64str.slice(0, canBeDecoded)
 
-        res += this.iconv.decode(Buffer.from(b64str, 'base64'), "utf16-be");
-    }
+    res += this.iconv.decode(Buffer.from(b64str, "base64"), "utf16-be")
+  }
 
-    this.inBase64 = inBase64;
-    this.base64Accum = base64Accum;
+  this.inBase64 = inBase64
+  this.base64Accum = base64Accum
 
-    return res;
+  return res
 }
 
-Utf7Decoder.prototype.end = function() {
-    var res = "";
-    if (this.inBase64 && this.base64Accum.length > 0)
-        res = this.iconv.decode(Buffer.from(this.base64Accum, 'base64'), "utf16-be");
+Utf7Decoder.prototype.end = function () {
+  var res = ""
+  if (this.inBase64 && this.base64Accum.length > 0) { res = this.iconv.decode(Buffer.from(this.base64Accum, "base64"), "utf16-be") }
 
-    this.inBase64 = false;
-    this.base64Accum = '';
-    return res;
+  this.inBase64 = false
+  this.base64Accum = ""
+  return res
 }
-
 
 // UTF-7-IMAP codec.
 // RFC3501 Sec. 5.1.3 Modified UTF-7 (http://tools.ietf.org/html/rfc3501#section-5.1.3)
@@ -18063,166 +17031,159 @@ Utf7Decoder.prototype.end = function() {
 //  * String must end in non-shifted position.
 //  * "-&" while in base64 is not allowed.
 
-
-exports.utf7imap = Utf7IMAPCodec;
-function Utf7IMAPCodec(codecOptions, iconv) {
-    this.iconv = iconv;
+exports.utf7imap = Utf7IMAPCodec
+function Utf7IMAPCodec (codecOptions, iconv) {
+  this.iconv = iconv
 };
 
-Utf7IMAPCodec.prototype.encoder = Utf7IMAPEncoder;
-Utf7IMAPCodec.prototype.decoder = Utf7IMAPDecoder;
-Utf7IMAPCodec.prototype.bomAware = true;
-
+Utf7IMAPCodec.prototype.encoder = Utf7IMAPEncoder
+Utf7IMAPCodec.prototype.decoder = Utf7IMAPDecoder
+Utf7IMAPCodec.prototype.bomAware = true
 
 // -- Encoding
 
-function Utf7IMAPEncoder(options, codec) {
-    this.iconv = codec.iconv;
-    this.inBase64 = false;
-    this.base64Accum = Buffer.alloc(6);
-    this.base64AccumIdx = 0;
+function Utf7IMAPEncoder (options, codec) {
+  this.iconv = codec.iconv
+  this.inBase64 = false
+  this.base64Accum = Buffer.alloc(6)
+  this.base64AccumIdx = 0
 }
 
-Utf7IMAPEncoder.prototype.write = function(str) {
-    var inBase64 = this.inBase64,
-        base64Accum = this.base64Accum,
-        base64AccumIdx = this.base64AccumIdx,
-        buf = Buffer.alloc(str.length*5 + 10), bufIdx = 0;
+Utf7IMAPEncoder.prototype.write = function (str) {
+  var inBase64 = this.inBase64
+  var base64Accum = this.base64Accum
+  var base64AccumIdx = this.base64AccumIdx
+  var buf = Buffer.alloc(str.length * 5 + 10); var bufIdx = 0
 
-    for (var i = 0; i < str.length; i++) {
-        var uChar = str.charCodeAt(i);
-        if (0x20 <= uChar && uChar <= 0x7E) { // Direct character or '&'.
-            if (inBase64) {
-                if (base64AccumIdx > 0) {
-                    bufIdx += buf.write(base64Accum.slice(0, base64AccumIdx).toString('base64').replace(/\//g, ',').replace(/=+$/, ''), bufIdx);
-                    base64AccumIdx = 0;
-                }
-
-                buf[bufIdx++] = minusChar; // Write '-', then go to direct mode.
-                inBase64 = false;
-            }
-
-            if (!inBase64) {
-                buf[bufIdx++] = uChar; // Write direct character
-
-                if (uChar === andChar)  // Ampersand -> '&-'
-                    buf[bufIdx++] = minusChar;
-            }
-
-        } else { // Non-direct character
-            if (!inBase64) {
-                buf[bufIdx++] = andChar; // Write '&', then go to base64 mode.
-                inBase64 = true;
-            }
-            if (inBase64) {
-                base64Accum[base64AccumIdx++] = uChar >> 8;
-                base64Accum[base64AccumIdx++] = uChar & 0xFF;
-
-                if (base64AccumIdx == base64Accum.length) {
-                    bufIdx += buf.write(base64Accum.toString('base64').replace(/\//g, ','), bufIdx);
-                    base64AccumIdx = 0;
-                }
-            }
-        }
-    }
-
-    this.inBase64 = inBase64;
-    this.base64AccumIdx = base64AccumIdx;
-
-    return buf.slice(0, bufIdx);
-}
-
-Utf7IMAPEncoder.prototype.end = function() {
-    var buf = Buffer.alloc(10), bufIdx = 0;
-    if (this.inBase64) {
-        if (this.base64AccumIdx > 0) {
-            bufIdx += buf.write(this.base64Accum.slice(0, this.base64AccumIdx).toString('base64').replace(/\//g, ',').replace(/=+$/, ''), bufIdx);
-            this.base64AccumIdx = 0;
+  for (var i = 0; i < str.length; i++) {
+    var uChar = str.charCodeAt(i)
+    if (uChar >= 0x20 && uChar <= 0x7E) { // Direct character or '&'.
+      if (inBase64) {
+        if (base64AccumIdx > 0) {
+          bufIdx += buf.write(base64Accum.slice(0, base64AccumIdx).toString("base64").replace(/\//g, ",").replace(/=+$/, ""), bufIdx)
+          base64AccumIdx = 0
         }
 
-        buf[bufIdx++] = minusChar; // Write '-', then go to direct mode.
-        this.inBase64 = false;
-    }
+        buf[bufIdx++] = minusChar // Write '-', then go to direct mode.
+        inBase64 = false
+      }
 
-    return buf.slice(0, bufIdx);
+      if (!inBase64) {
+        buf[bufIdx++] = uChar // Write direct character
+
+        if (uChar === andChar)  // Ampersand -> '&-'
+        { buf[bufIdx++] = minusChar }
+      }
+    } else { // Non-direct character
+      if (!inBase64) {
+        buf[bufIdx++] = andChar // Write '&', then go to base64 mode.
+        inBase64 = true
+      }
+      if (inBase64) {
+        base64Accum[base64AccumIdx++] = uChar >> 8
+        base64Accum[base64AccumIdx++] = uChar & 0xFF
+
+        if (base64AccumIdx == base64Accum.length) {
+          bufIdx += buf.write(base64Accum.toString("base64").replace(/\//g, ","), bufIdx)
+          base64AccumIdx = 0
+        }
+      }
+    }
+  }
+
+  this.inBase64 = inBase64
+  this.base64AccumIdx = base64AccumIdx
+
+  return buf.slice(0, bufIdx)
 }
 
+Utf7IMAPEncoder.prototype.end = function () {
+  var buf = Buffer.alloc(10); var bufIdx = 0
+  if (this.inBase64) {
+    if (this.base64AccumIdx > 0) {
+      bufIdx += buf.write(this.base64Accum.slice(0, this.base64AccumIdx).toString("base64").replace(/\//g, ",").replace(/=+$/, ""), bufIdx)
+      this.base64AccumIdx = 0
+    }
+
+    buf[bufIdx++] = minusChar // Write '-', then go to direct mode.
+    this.inBase64 = false
+  }
+
+  return buf.slice(0, bufIdx)
+}
 
 // -- Decoding
 
-function Utf7IMAPDecoder(options, codec) {
-    this.iconv = codec.iconv;
-    this.inBase64 = false;
-    this.base64Accum = '';
+function Utf7IMAPDecoder (options, codec) {
+  this.iconv = codec.iconv
+  this.inBase64 = false
+  this.base64Accum = ""
 }
 
-var base64IMAPChars = base64Chars.slice();
-base64IMAPChars[','.charCodeAt(0)] = true;
+var base64IMAPChars = base64Chars.slice()
+base64IMAPChars[",".charCodeAt(0)] = true
 
-Utf7IMAPDecoder.prototype.write = function(buf) {
-    var res = "", lastI = 0,
-        inBase64 = this.inBase64,
-        base64Accum = this.base64Accum;
+Utf7IMAPDecoder.prototype.write = function (buf) {
+  var res = ""; var lastI = 0
+  var inBase64 = this.inBase64
+  var base64Accum = this.base64Accum
 
-    // The decoder is more involved as we must handle chunks in stream.
-    // It is forgiving, closer to standard UTF-7 (for example, '-' is optional at the end).
+  // The decoder is more involved as we must handle chunks in stream.
+  // It is forgiving, closer to standard UTF-7 (for example, '-' is optional at the end).
 
-    for (var i = 0; i < buf.length; i++) {
-        if (!inBase64) { // We're in direct mode.
-            // Write direct chars until '&'
-            if (buf[i] == andChar) {
-                res += this.iconv.decode(buf.slice(lastI, i), "ascii"); // Write direct chars.
-                lastI = i+1;
-                inBase64 = true;
-            }
-        } else { // We decode base64.
-            if (!base64IMAPChars[buf[i]]) { // Base64 ended.
-                if (i == lastI && buf[i] == minusChar) { // "&-" -> "&"
-                    res += "&";
-                } else {
-                    var b64str = base64Accum + buf.slice(lastI, i).toString().replace(/,/g, '/');
-                    res += this.iconv.decode(Buffer.from(b64str, 'base64'), "utf16-be");
-                }
-
-                if (buf[i] != minusChar) // Minus may be absorbed after base64.
-                    i--;
-
-                lastI = i+1;
-                inBase64 = false;
-                base64Accum = '';
-            }
+  for (var i = 0; i < buf.length; i++) {
+    if (!inBase64) { // We're in direct mode.
+      // Write direct chars until '&'
+      if (buf[i] == andChar) {
+        res += this.iconv.decode(buf.slice(lastI, i), "ascii") // Write direct chars.
+        lastI = i + 1
+        inBase64 = true
+      }
+    } else { // We decode base64.
+      if (!base64IMAPChars[buf[i]]) { // Base64 ended.
+        if (i == lastI && buf[i] == minusChar) { // "&-" -> "&"
+          res += "&"
+        } else {
+          var b64str = base64Accum + this.iconv.decode(buf.slice(lastI, i), "ascii").replace(/,/g, "/")
+          res += this.iconv.decode(Buffer.from(b64str, "base64"), "utf16-be")
         }
+
+        if (buf[i] != minusChar) // Minus may be absorbed after base64.
+        { i-- }
+
+        lastI = i + 1
+        inBase64 = false
+        base64Accum = ""
+      }
     }
+  }
 
-    if (!inBase64) {
-        res += this.iconv.decode(buf.slice(lastI), "ascii"); // Write direct chars.
-    } else {
-        var b64str = base64Accum + buf.slice(lastI).toString().replace(/,/g, '/');
+  if (!inBase64) {
+    res += this.iconv.decode(buf.slice(lastI), "ascii") // Write direct chars.
+  } else {
+    var b64str = base64Accum + this.iconv.decode(buf.slice(lastI), "ascii").replace(/,/g, "/")
 
-        var canBeDecoded = b64str.length - (b64str.length % 8); // Minimal chunk: 2 quads -> 2x3 bytes -> 3 chars.
-        base64Accum = b64str.slice(canBeDecoded); // The rest will be decoded in future.
-        b64str = b64str.slice(0, canBeDecoded);
+    var canBeDecoded = b64str.length - (b64str.length % 8) // Minimal chunk: 2 quads -> 2x3 bytes -> 3 chars.
+    base64Accum = b64str.slice(canBeDecoded) // The rest will be decoded in future.
+    b64str = b64str.slice(0, canBeDecoded)
 
-        res += this.iconv.decode(Buffer.from(b64str, 'base64'), "utf16-be");
-    }
+    res += this.iconv.decode(Buffer.from(b64str, "base64"), "utf16-be")
+  }
 
-    this.inBase64 = inBase64;
-    this.base64Accum = base64Accum;
+  this.inBase64 = inBase64
+  this.base64Accum = base64Accum
 
-    return res;
+  return res
 }
 
-Utf7IMAPDecoder.prototype.end = function() {
-    var res = "";
-    if (this.inBase64 && this.base64Accum.length > 0)
-        res = this.iconv.decode(Buffer.from(this.base64Accum, 'base64'), "utf16-be");
+Utf7IMAPDecoder.prototype.end = function () {
+  var res = ""
+  if (this.inBase64 && this.base64Accum.length > 0) { res = this.iconv.decode(Buffer.from(this.base64Accum, "base64"), "utf16-be") }
 
-    this.inBase64 = false;
-    this.base64Accum = '';
-    return res;
+  this.inBase64 = false
+  this.base64Accum = ""
+  return res
 }
-
-
 
 
 /***/ }),
@@ -18233,281 +17194,73 @@ Utf7IMAPDecoder.prototype.end = function() {
 "use strict";
 
 
-var BOMChar = '\uFEFF';
+var BOMChar = "\uFEFF"
 
 exports.PrependBOM = PrependBOMWrapper
-function PrependBOMWrapper(encoder, options) {
-    this.encoder = encoder;
-    this.addBOM = true;
+function PrependBOMWrapper (encoder, options) {
+  this.encoder = encoder
+  this.addBOM = true
 }
 
-PrependBOMWrapper.prototype.write = function(str) {
-    if (this.addBOM) {
-        str = BOMChar + str;
-        this.addBOM = false;
-    }
+PrependBOMWrapper.prototype.write = function (str) {
+  if (this.addBOM) {
+    str = BOMChar + str
+    this.addBOM = false
+  }
 
-    return this.encoder.write(str);
+  return this.encoder.write(str)
 }
 
-PrependBOMWrapper.prototype.end = function() {
-    return this.encoder.end();
+PrependBOMWrapper.prototype.end = function () {
+  return this.encoder.end()
 }
 
+// ------------------------------------------------------------------------------
 
-//------------------------------------------------------------------------------
-
-exports.StripBOM = StripBOMWrapper;
-function StripBOMWrapper(decoder, options) {
-    this.decoder = decoder;
-    this.pass = false;
-    this.options = options || {};
+exports.StripBOM = StripBOMWrapper
+function StripBOMWrapper (decoder, options) {
+  this.decoder = decoder
+  this.pass = false
+  this.options = options || {}
 }
 
-StripBOMWrapper.prototype.write = function(buf) {
-    var res = this.decoder.write(buf);
-    if (this.pass || !res)
-        return res;
+StripBOMWrapper.prototype.write = function (buf) {
+  var res = this.decoder.write(buf)
+  if (this.pass || !res) { return res }
 
-    if (res[0] === BOMChar) {
-        res = res.slice(1);
-        if (typeof this.options.stripBOM === 'function')
-            this.options.stripBOM();
-    }
+  if (res[0] === BOMChar) {
+    res = res.slice(1)
+    if (typeof this.options.stripBOM === "function") { this.options.stripBOM() }
+  }
 
-    this.pass = true;
-    return res;
+  this.pass = true
+  return res
 }
 
-StripBOMWrapper.prototype.end = function() {
-    return this.decoder.end();
+StripBOMWrapper.prototype.end = function () {
+  return this.decoder.end()
 }
-
 
 
 /***/ }),
 
-/***/ 4939:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ 5336:
+/***/ ((module) => {
 
 "use strict";
 
-var Buffer = (__nccwpck_require__(181).Buffer);
-// Note: not polyfilled with safer-buffer on a purpose, as overrides Buffer
 
-// == Extend Node primitives to use iconv-lite =================================
+var hasOwn = typeof Object.hasOwn === "undefined" ? Function.call.bind(Object.prototype.hasOwnProperty) : Object.hasOwn
 
-module.exports = function (iconv) {
-    var original = undefined; // Place to keep original methods.
-
-    // Node authors rewrote Buffer internals to make it compatible with
-    // Uint8Array and we cannot patch key functions since then.
-    // Note: this does use older Buffer API on a purpose
-    iconv.supportsNodeEncodingsExtension = !(Buffer.from || new Buffer(0) instanceof Uint8Array);
-
-    iconv.extendNodeEncodings = function extendNodeEncodings() {
-        if (original) return;
-        original = {};
-
-        if (!iconv.supportsNodeEncodingsExtension) {
-            console.error("ACTION NEEDED: require('iconv-lite').extendNodeEncodings() is not supported in your version of Node");
-            console.error("See more info at https://github.com/ashtuchkin/iconv-lite/wiki/Node-v4-compatibility");
-            return;
-        }
-
-        var nodeNativeEncodings = {
-            'hex': true, 'utf8': true, 'utf-8': true, 'ascii': true, 'binary': true, 
-            'base64': true, 'ucs2': true, 'ucs-2': true, 'utf16le': true, 'utf-16le': true,
-        };
-
-        Buffer.isNativeEncoding = function(enc) {
-            return enc && nodeNativeEncodings[enc.toLowerCase()];
-        }
-
-        // -- SlowBuffer -----------------------------------------------------------
-        var SlowBuffer = (__nccwpck_require__(181).SlowBuffer);
-
-        original.SlowBufferToString = SlowBuffer.prototype.toString;
-        SlowBuffer.prototype.toString = function(encoding, start, end) {
-            encoding = String(encoding || 'utf8').toLowerCase();
-
-            // Use native conversion when possible
-            if (Buffer.isNativeEncoding(encoding))
-                return original.SlowBufferToString.call(this, encoding, start, end);
-
-            // Otherwise, use our decoding method.
-            if (typeof start == 'undefined') start = 0;
-            if (typeof end == 'undefined') end = this.length;
-            return iconv.decode(this.slice(start, end), encoding);
-        }
-
-        original.SlowBufferWrite = SlowBuffer.prototype.write;
-        SlowBuffer.prototype.write = function(string, offset, length, encoding) {
-            // Support both (string, offset, length, encoding)
-            // and the legacy (string, encoding, offset, length)
-            if (isFinite(offset)) {
-                if (!isFinite(length)) {
-                    encoding = length;
-                    length = undefined;
-                }
-            } else {  // legacy
-                var swap = encoding;
-                encoding = offset;
-                offset = length;
-                length = swap;
-            }
-
-            offset = +offset || 0;
-            var remaining = this.length - offset;
-            if (!length) {
-                length = remaining;
-            } else {
-                length = +length;
-                if (length > remaining) {
-                    length = remaining;
-                }
-            }
-            encoding = String(encoding || 'utf8').toLowerCase();
-
-            // Use native conversion when possible
-            if (Buffer.isNativeEncoding(encoding))
-                return original.SlowBufferWrite.call(this, string, offset, length, encoding);
-
-            if (string.length > 0 && (length < 0 || offset < 0))
-                throw new RangeError('attempt to write beyond buffer bounds');
-
-            // Otherwise, use our encoding method.
-            var buf = iconv.encode(string, encoding);
-            if (buf.length < length) length = buf.length;
-            buf.copy(this, offset, 0, length);
-            return length;
-        }
-
-        // -- Buffer ---------------------------------------------------------------
-
-        original.BufferIsEncoding = Buffer.isEncoding;
-        Buffer.isEncoding = function(encoding) {
-            return Buffer.isNativeEncoding(encoding) || iconv.encodingExists(encoding);
-        }
-
-        original.BufferByteLength = Buffer.byteLength;
-        Buffer.byteLength = SlowBuffer.byteLength = function(str, encoding) {
-            encoding = String(encoding || 'utf8').toLowerCase();
-
-            // Use native conversion when possible
-            if (Buffer.isNativeEncoding(encoding))
-                return original.BufferByteLength.call(this, str, encoding);
-
-            // Slow, I know, but we don't have a better way yet.
-            return iconv.encode(str, encoding).length;
-        }
-
-        original.BufferToString = Buffer.prototype.toString;
-        Buffer.prototype.toString = function(encoding, start, end) {
-            encoding = String(encoding || 'utf8').toLowerCase();
-
-            // Use native conversion when possible
-            if (Buffer.isNativeEncoding(encoding))
-                return original.BufferToString.call(this, encoding, start, end);
-
-            // Otherwise, use our decoding method.
-            if (typeof start == 'undefined') start = 0;
-            if (typeof end == 'undefined') end = this.length;
-            return iconv.decode(this.slice(start, end), encoding);
-        }
-
-        original.BufferWrite = Buffer.prototype.write;
-        Buffer.prototype.write = function(string, offset, length, encoding) {
-            var _offset = offset, _length = length, _encoding = encoding;
-            // Support both (string, offset, length, encoding)
-            // and the legacy (string, encoding, offset, length)
-            if (isFinite(offset)) {
-                if (!isFinite(length)) {
-                    encoding = length;
-                    length = undefined;
-                }
-            } else {  // legacy
-                var swap = encoding;
-                encoding = offset;
-                offset = length;
-                length = swap;
-            }
-
-            encoding = String(encoding || 'utf8').toLowerCase();
-
-            // Use native conversion when possible
-            if (Buffer.isNativeEncoding(encoding))
-                return original.BufferWrite.call(this, string, _offset, _length, _encoding);
-
-            offset = +offset || 0;
-            var remaining = this.length - offset;
-            if (!length) {
-                length = remaining;
-            } else {
-                length = +length;
-                if (length > remaining) {
-                    length = remaining;
-                }
-            }
-
-            if (string.length > 0 && (length < 0 || offset < 0))
-                throw new RangeError('attempt to write beyond buffer bounds');
-
-            // Otherwise, use our encoding method.
-            var buf = iconv.encode(string, encoding);
-            if (buf.length < length) length = buf.length;
-            buf.copy(this, offset, 0, length);
-            return length;
-
-            // TODO: Set _charsWritten.
-        }
-
-
-        // -- Readable -------------------------------------------------------------
-        if (iconv.supportsStreams) {
-            var Readable = (__nccwpck_require__(2203).Readable);
-
-            original.ReadableSetEncoding = Readable.prototype.setEncoding;
-            Readable.prototype.setEncoding = function setEncoding(enc, options) {
-                // Use our own decoder, it has the same interface.
-                // We cannot use original function as it doesn't handle BOM-s.
-                this._readableState.decoder = iconv.getDecoder(enc, options);
-                this._readableState.encoding = enc;
-            }
-
-            Readable.prototype.collect = iconv._collect;
-        }
+function mergeModules (target, module) {
+  for (var key in module) {
+    if (hasOwn(module, key)) {
+      target[key] = module[key]
     }
-
-    // Remove iconv-lite Node primitive extensions.
-    iconv.undoExtendNodeEncodings = function undoExtendNodeEncodings() {
-        if (!iconv.supportsNodeEncodingsExtension)
-            return;
-        if (!original)
-            throw new Error("require('iconv-lite').undoExtendNodeEncodings(): Nothing to undo; extendNodeEncodings() is not called.")
-
-        delete Buffer.isNativeEncoding;
-
-        var SlowBuffer = (__nccwpck_require__(181).SlowBuffer);
-
-        SlowBuffer.prototype.toString = original.SlowBufferToString;
-        SlowBuffer.prototype.write = original.SlowBufferWrite;
-
-        Buffer.isEncoding = original.BufferIsEncoding;
-        Buffer.byteLength = original.BufferByteLength;
-        Buffer.prototype.toString = original.BufferToString;
-        Buffer.prototype.write = original.BufferWrite;
-
-        if (iconv.supportsStreams) {
-            var Readable = (__nccwpck_require__(2203).Readable);
-
-            Readable.prototype.setEncoding = original.ReadableSetEncoding;
-            delete Readable.prototype.collect;
-        }
-
-        original = undefined;
-    }
+  }
 }
+
+module.exports = mergeModules
 
 
 /***/ }),
@@ -18518,154 +17271,183 @@ module.exports = function (iconv) {
 "use strict";
 
 
-// Some environments don't have global Buffer (e.g. React Native).
-// Solution would be installing npm modules "buffer" and "stream" explicitly.
-var Buffer = (__nccwpck_require__(2803).Buffer);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
-var bomHandling = __nccwpck_require__(4250),
-    iconv = module.exports;
+var bomHandling = __nccwpck_require__(4250)
+var mergeModules = __nccwpck_require__(5336)
 
 // All codecs and aliases are kept here, keyed by encoding name/alias.
 // They are lazy loaded in `iconv.getCodec` from `encodings/index.js`.
-iconv.encodings = null;
+// Cannot initialize with { __proto__: null } because Boolean({ __proto__: null }) === true
+module.exports.encodings = null
 
 // Characters emitted in case of error.
-iconv.defaultCharUnicode = '�';
-iconv.defaultCharSingleByte = '?';
+module.exports.defaultCharUnicode = "�"
+module.exports.defaultCharSingleByte = "?"
 
 // Public API.
-iconv.encode = function encode(str, encoding, options) {
-    str = "" + (str || ""); // Ensure string.
+module.exports.encode = function encode (str, encoding, options) {
+  str = "" + (str || "") // Ensure string.
 
-    var encoder = iconv.getEncoder(encoding, options);
+  var encoder = module.exports.getEncoder(encoding, options)
 
-    var res = encoder.write(str);
-    var trail = encoder.end();
-    
-    return (trail && trail.length > 0) ? Buffer.concat([res, trail]) : res;
+  var res = encoder.write(str)
+  var trail = encoder.end()
+
+  return (trail && trail.length > 0) ? Buffer.concat([res, trail]) : res
 }
 
-iconv.decode = function decode(buf, encoding, options) {
-    if (typeof buf === 'string') {
-        if (!iconv.skipDecodeWarning) {
-            console.error('Iconv-lite warning: decode()-ing strings is deprecated. Refer to https://github.com/ashtuchkin/iconv-lite/wiki/Use-Buffers-when-decoding');
-            iconv.skipDecodeWarning = true;
-        }
-
-        buf = Buffer.from("" + (buf || ""), "binary"); // Ensure buffer.
+module.exports.decode = function decode (buf, encoding, options) {
+  if (typeof buf === "string") {
+    if (!module.exports.skipDecodeWarning) {
+      console.error("Iconv-lite warning: decode()-ing strings is deprecated. Refer to https://github.com/ashtuchkin/iconv-lite/wiki/Use-Buffers-when-decoding")
+      module.exports.skipDecodeWarning = true
     }
 
-    var decoder = iconv.getDecoder(encoding, options);
+    buf = Buffer.from("" + (buf || ""), "binary") // Ensure buffer.
+  }
 
-    var res = decoder.write(buf);
-    var trail = decoder.end();
+  var decoder = module.exports.getDecoder(encoding, options)
 
-    return trail ? (res + trail) : res;
+  var res = decoder.write(buf)
+  var trail = decoder.end()
+
+  return trail ? (res + trail) : res
 }
 
-iconv.encodingExists = function encodingExists(enc) {
-    try {
-        iconv.getCodec(enc);
-        return true;
-    } catch (e) {
-        return false;
-    }
+module.exports.encodingExists = function encodingExists (enc) {
+  try {
+    module.exports.getCodec(enc)
+    return true
+  } catch (e) {
+    return false
+  }
 }
 
 // Legacy aliases to convert functions
-iconv.toEncoding = iconv.encode;
-iconv.fromEncoding = iconv.decode;
+module.exports.toEncoding = module.exports.encode
+module.exports.fromEncoding = module.exports.decode
 
 // Search for a codec in iconv.encodings. Cache codec data in iconv._codecDataCache.
-iconv._codecDataCache = {};
-iconv.getCodec = function getCodec(encoding) {
-    if (!iconv.encodings)
-        iconv.encodings = __nccwpck_require__(7585); // Lazy load all encoding definitions.
-    
-    // Canonicalize encoding name: strip all non-alphanumeric chars and appended year.
-    var enc = iconv._canonicalizeEncoding(encoding);
+module.exports._codecDataCache = { __proto__: null }
 
-    // Traverse iconv.encodings to find actual codec.
-    var codecOptions = {};
-    while (true) {
-        var codec = iconv._codecDataCache[enc];
-        if (codec)
-            return codec;
+module.exports.getCodec = function getCodec (encoding) {
+  if (!module.exports.encodings) {
+    var raw = __nccwpck_require__(7585)
+    // TODO: In future versions when old nodejs support is removed can use object.assign
+    module.exports.encodings = { __proto__: null } // Initialize as empty object.
+    mergeModules(module.exports.encodings, raw)
+  }
 
-        var codecDef = iconv.encodings[enc];
+  // Canonicalize encoding name: strip all non-alphanumeric chars and appended year.
+  var enc = module.exports._canonicalizeEncoding(encoding)
 
-        switch (typeof codecDef) {
-            case "string": // Direct alias to other encoding.
-                enc = codecDef;
-                break;
+  // Traverse iconv.encodings to find actual codec.
+  var codecOptions = {}
+  while (true) {
+    var codec = module.exports._codecDataCache[enc]
 
-            case "object": // Alias with options. Can be layered.
-                for (var key in codecDef)
-                    codecOptions[key] = codecDef[key];
+    if (codec) { return codec }
 
-                if (!codecOptions.encodingName)
-                    codecOptions.encodingName = enc;
-                
-                enc = codecDef.type;
-                break;
+    var codecDef = module.exports.encodings[enc]
 
-            case "function": // Codec itself.
-                if (!codecOptions.encodingName)
-                    codecOptions.encodingName = enc;
+    switch (typeof codecDef) {
+      case "string": // Direct alias to other encoding.
+        enc = codecDef
+        break
 
-                // The codec function must load all tables and return object with .encoder and .decoder methods.
-                // It'll be called only once (for each different options object).
-                codec = new codecDef(codecOptions, iconv);
+      case "object": // Alias with options. Can be layered.
+        for (var key in codecDef) { codecOptions[key] = codecDef[key] }
 
-                iconv._codecDataCache[codecOptions.encodingName] = codec; // Save it to be reused later.
-                return codec;
+        if (!codecOptions.encodingName) { codecOptions.encodingName = enc }
 
-            default:
-                throw new Error("Encoding not recognized: '" + encoding + "' (searched as: '"+enc+"')");
-        }
+        enc = codecDef.type
+        break
+
+      case "function": // Codec itself.
+        if (!codecOptions.encodingName) { codecOptions.encodingName = enc }
+
+        // The codec function must load all tables and return object with .encoder and .decoder methods.
+        // It'll be called only once (for each different options object).
+        //
+        codec = new codecDef(codecOptions, module.exports)
+
+        module.exports._codecDataCache[codecOptions.encodingName] = codec // Save it to be reused later.
+        return codec
+
+      default:
+        throw new Error("Encoding not recognized: '" + encoding + "' (searched as: '" + enc + "')")
     }
+  }
 }
 
-iconv._canonicalizeEncoding = function(encoding) {
-    // Canonicalize encoding name: strip all non-alphanumeric chars and appended year.
-    return (''+encoding).toLowerCase().replace(/:\d{4}$|[^0-9a-z]/g, "");
+module.exports._canonicalizeEncoding = function (encoding) {
+  // Canonicalize encoding name: strip all non-alphanumeric chars and appended year.
+  return ("" + encoding).toLowerCase().replace(/:\d{4}$|[^0-9a-z]/g, "")
 }
 
-iconv.getEncoder = function getEncoder(encoding, options) {
-    var codec = iconv.getCodec(encoding),
-        encoder = new codec.encoder(options, codec);
+module.exports.getEncoder = function getEncoder (encoding, options) {
+  var codec = module.exports.getCodec(encoding)
+  var encoder = new codec.encoder(options, codec)
 
-    if (codec.bomAware && options && options.addBOM)
-        encoder = new bomHandling.PrependBOM(encoder, options);
+  if (codec.bomAware && options && options.addBOM) { encoder = new bomHandling.PrependBOM(encoder, options) }
 
-    return encoder;
+  return encoder
 }
 
-iconv.getDecoder = function getDecoder(encoding, options) {
-    var codec = iconv.getCodec(encoding),
-        decoder = new codec.decoder(options, codec);
+module.exports.getDecoder = function getDecoder (encoding, options) {
+  var codec = module.exports.getCodec(encoding)
+  var decoder = new codec.decoder(options, codec)
 
-    if (codec.bomAware && !(options && options.stripBOM === false))
-        decoder = new bomHandling.StripBOM(decoder, options);
+  if (codec.bomAware && !(options && options.stripBOM === false)) { decoder = new bomHandling.StripBOM(decoder, options) }
 
-    return decoder;
+  return decoder
 }
 
+// Streaming API
+// NOTE: Streaming API naturally depends on 'stream' module from Node.js. Unfortunately in browser environments this module can add
+// up to 100Kb to the output bundle. To avoid unnecessary code bloat, we don't enable Streaming API in browser by default.
+// If you would like to enable it explicitly, please add the following code to your app:
+// > iconv.enableStreamingAPI(require('stream'));
+module.exports.enableStreamingAPI = function enableStreamingAPI (streamModule) {
+  if (module.exports.supportsStreams) { return }
 
-// Load extensions in Node. All of them are omitted in Browserify build via 'browser' field in package.json.
-var nodeVer = typeof process !== 'undefined' && process.versions && process.versions.node;
-if (nodeVer) {
+  // Dependency-inject stream module to create IconvLite stream classes.
+  var streams = __nccwpck_require__(2281)(streamModule)
 
-    // Load streaming support in Node v0.10+
-    var nodeVerArr = nodeVer.split(".").map(Number);
-    if (nodeVerArr[0] > 0 || nodeVerArr[1] >= 10) {
-        __nccwpck_require__(2281)(iconv);
-    }
+  // Not public API yet, but expose the stream classes.
+  module.exports.IconvLiteEncoderStream = streams.IconvLiteEncoderStream
+  module.exports.IconvLiteDecoderStream = streams.IconvLiteDecoderStream
 
-    // Load Node primitive extensions.
-    __nccwpck_require__(4939)(iconv);
+  // Streaming API.
+  module.exports.encodeStream = function encodeStream (encoding, options) {
+    return new module.exports.IconvLiteEncoderStream(module.exports.getEncoder(encoding, options), options)
+  }
+
+  module.exports.decodeStream = function decodeStream (encoding, options) {
+    return new module.exports.IconvLiteDecoderStream(module.exports.getDecoder(encoding, options), options)
+  }
+
+  module.exports.supportsStreams = true
 }
 
+// Enable Streaming API automatically if 'stream' module is available and non-empty (the majority of environments).
+var streamModule
+try {
+  streamModule = __nccwpck_require__(2203)
+} catch (e) {}
+
+if (streamModule && streamModule.Transform) {
+  module.exports.enableStreamingAPI(streamModule)
+} else {
+  // In rare cases where 'stream' module is not available by default, throw a helpful exception.
+  module.exports.encodeStream = module.exports.decodeStream = function () {
+    throw new Error("iconv-lite Streaming API is not enabled. Use iconv.enableStreamingAPI(require('stream')); to enable it.")
+  }
+}
+
+// Some environments, such as browsers, may not load JavaScript files as UTF-8
+// eslint-disable-next-line no-constant-condition
 if (false) {}
 
 
@@ -18677,125 +17459,109 @@ if (false) {}
 "use strict";
 
 
-var Buffer = (__nccwpck_require__(181).Buffer),
-    Transform = (__nccwpck_require__(2203).Transform);
+var Buffer = (__nccwpck_require__(2803).Buffer)
 
+// NOTE: Due to 'stream' module being pretty large (~100Kb, significant in browser environments),
+// we opt to dependency-inject it instead of creating a hard dependency.
+module.exports = function (streamModule) {
+  var Transform = streamModule.Transform
 
-// == Exports ==================================================================
-module.exports = function(iconv) {
-    
-    // Additional Public API.
-    iconv.encodeStream = function encodeStream(encoding, options) {
-        return new IconvLiteEncoderStream(iconv.getEncoder(encoding, options), options);
-    }
+  // == Encoder stream =======================================================
 
-    iconv.decodeStream = function decodeStream(encoding, options) {
-        return new IconvLiteDecoderStream(iconv.getDecoder(encoding, options), options);
-    }
+  function IconvLiteEncoderStream (conv, options) {
+    this.conv = conv
+    options = options || {}
+    options.decodeStrings = false // We accept only strings, so we don't need to decode them.
+    Transform.call(this, options)
+  }
 
-    iconv.supportsStreams = true;
-
-
-    // Not published yet.
-    iconv.IconvLiteEncoderStream = IconvLiteEncoderStream;
-    iconv.IconvLiteDecoderStream = IconvLiteDecoderStream;
-    iconv._collect = IconvLiteDecoderStream.prototype.collect;
-};
-
-
-// == Encoder stream =======================================================
-function IconvLiteEncoderStream(conv, options) {
-    this.conv = conv;
-    options = options || {};
-    options.decodeStrings = false; // We accept only strings, so we don't need to decode them.
-    Transform.call(this, options);
-}
-
-IconvLiteEncoderStream.prototype = Object.create(Transform.prototype, {
+  IconvLiteEncoderStream.prototype = Object.create(Transform.prototype, {
     constructor: { value: IconvLiteEncoderStream }
-});
+  })
 
-IconvLiteEncoderStream.prototype._transform = function(chunk, encoding, done) {
-    if (typeof chunk != 'string')
-        return done(new Error("Iconv encoding stream needs strings as its input."));
+  IconvLiteEncoderStream.prototype._transform = function (chunk, encoding, done) {
+    if (typeof chunk !== "string") {
+      return done(new Error("Iconv encoding stream needs strings as its input."))
+    }
+
     try {
-        var res = this.conv.write(chunk);
-        if (res && res.length) this.push(res);
-        done();
+      var res = this.conv.write(chunk)
+      if (res && res.length) this.push(res)
+      done()
+    } catch (e) {
+      done(e)
     }
-    catch (e) {
-        done(e);
-    }
-}
+  }
 
-IconvLiteEncoderStream.prototype._flush = function(done) {
+  IconvLiteEncoderStream.prototype._flush = function (done) {
     try {
-        var res = this.conv.end();
-        if (res && res.length) this.push(res);
-        done();
+      var res = this.conv.end()
+      if (res && res.length) this.push(res)
+      done()
+    } catch (e) {
+      done(e)
     }
-    catch (e) {
-        done(e);
-    }
-}
+  }
 
-IconvLiteEncoderStream.prototype.collect = function(cb) {
-    var chunks = [];
-    this.on('error', cb);
-    this.on('data', function(chunk) { chunks.push(chunk); });
-    this.on('end', function() {
-        cb(null, Buffer.concat(chunks));
-    });
-    return this;
-}
+  IconvLiteEncoderStream.prototype.collect = function (cb) {
+    var chunks = []
+    this.on("error", cb)
+    this.on("data", function (chunk) { chunks.push(chunk) })
+    this.on("end", function () {
+      cb(null, Buffer.concat(chunks))
+    })
+    return this
+  }
 
+  // == Decoder stream =======================================================
 
-// == Decoder stream =======================================================
-function IconvLiteDecoderStream(conv, options) {
-    this.conv = conv;
-    options = options || {};
-    options.encoding = this.encoding = 'utf8'; // We output strings.
-    Transform.call(this, options);
-}
+  function IconvLiteDecoderStream (conv, options) {
+    this.conv = conv
+    options = options || {}
+    options.encoding = this.encoding = "utf8" // We output strings.
+    Transform.call(this, options)
+  }
 
-IconvLiteDecoderStream.prototype = Object.create(Transform.prototype, {
+  IconvLiteDecoderStream.prototype = Object.create(Transform.prototype, {
     constructor: { value: IconvLiteDecoderStream }
-});
+  })
 
-IconvLiteDecoderStream.prototype._transform = function(chunk, encoding, done) {
-    if (!Buffer.isBuffer(chunk))
-        return done(new Error("Iconv decoding stream needs buffers as its input."));
+  IconvLiteDecoderStream.prototype._transform = function (chunk, encoding, done) {
+    if (!Buffer.isBuffer(chunk) && !(chunk instanceof Uint8Array)) { return done(new Error("Iconv decoding stream needs buffers as its input.")) }
     try {
-        var res = this.conv.write(chunk);
-        if (res && res.length) this.push(res, this.encoding);
-        done();
+      var res = this.conv.write(chunk)
+      if (res && res.length) this.push(res, this.encoding)
+      done()
+    } catch (e) {
+      done(e)
     }
-    catch (e) {
-        done(e);
-    }
-}
+  }
 
-IconvLiteDecoderStream.prototype._flush = function(done) {
+  IconvLiteDecoderStream.prototype._flush = function (done) {
     try {
-        var res = this.conv.end();
-        if (res && res.length) this.push(res, this.encoding);                
-        done();
+      var res = this.conv.end()
+      if (res && res.length) this.push(res, this.encoding)
+      done()
+    } catch (e) {
+      done(e)
     }
-    catch (e) {
-        done(e);
-    }
-}
+  }
 
-IconvLiteDecoderStream.prototype.collect = function(cb) {
-    var res = '';
-    this.on('error', cb);
-    this.on('data', function(chunk) { res += chunk; });
-    this.on('end', function() {
-        cb(null, res);
-    });
-    return this;
-}
+  IconvLiteDecoderStream.prototype.collect = function (cb) {
+    var res = ""
+    this.on("error", cb)
+    this.on("data", function (chunk) { res += chunk })
+    this.on("end", function () {
+      cb(null, res)
+    })
+    return this
+  }
 
+  return {
+    IconvLiteEncoderStream: IconvLiteEncoderStream,
+    IconvLiteDecoderStream: IconvLiteDecoderStream
+  }
+}
 
 
 /***/ }),
@@ -71385,6 +70151,1356 @@ function extend() {
 
 /***/ }),
 
+/***/ 4248:
+/***/ ((module) => {
+
+// Adapted from https://github.com/brianloveswords/buffer-crc32/blob/v0.2.13/index.js
+const CRC_TABLE = new Int32Array([
+  0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
+  0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
+  0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+  0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9, 0xfa0f3d63, 0x8d080df5,
+  0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172, 0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
+  0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+  0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423, 0xcfba9599, 0xb8bda50f,
+  0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924, 0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d,
+  0x76dc4190, 0x01db7106, 0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+  0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
+  0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e, 0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457,
+  0x65b0d9c6, 0x12b7e950, 0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+  0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb,
+  0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0, 0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9,
+  0x5005713c, 0x270241aa, 0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+  0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad,
+  0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a, 0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683,
+  0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+  0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb, 0x196c3671, 0x6e6b06e7,
+  0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc, 0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
+  0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+  0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55, 0x316e8eef, 0x4669be79,
+  0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236, 0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f,
+  0xc5ba3bbe, 0xb2bd0b28, 0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+  0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
+  0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38, 0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21,
+  0x86d3d2d4, 0xf1d4e242, 0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+  0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45,
+  0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2, 0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db,
+  0xaed16a4a, 0xd9d65adc, 0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+  0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf,
+  0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
+]);
+
+function crc32(buf) {
+  let crc = -1;
+  for (let x of buf) {
+    crc = CRC_TABLE[(crc ^ x) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+module.exports = crc32;
+
+
+/***/ }),
+
+/***/ 3502:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+// This was adapted from https://github.com/andrewrk/node-fd-slicer by Andrew Kelley under the MIT License.
+var fs = __nccwpck_require__(9896);
+var util = __nccwpck_require__(9023);
+var stream = __nccwpck_require__(2203);
+var Readable = stream.Readable;
+var PassThrough = stream.PassThrough;
+var Pend = __nccwpck_require__(3313);
+var EventEmitter = (__nccwpck_require__(4434).EventEmitter);
+
+exports.BufferSlicer = BufferSlicer;
+exports.FdSlicer = FdSlicer;
+
+util.inherits(FdSlicer, EventEmitter);
+function FdSlicer(fd) {
+  EventEmitter.call(this);
+
+  this.fd = fd;
+  this.pend = new Pend();
+  this.pend.max = 1;
+  this.refCount = 0;
+}
+
+FdSlicer.prototype.read = function(buffer, offset, length, position, callback) {
+  var self = this;
+  self.pend.go(function(cb) {
+    fs.read(self.fd, buffer, offset, length, position, function(err, bytesRead, buffer) {
+      cb();
+      callback(err, bytesRead, buffer);
+    });
+  });
+};
+
+FdSlicer.prototype.createReadStream = function(options) {
+  return new ReadStream(this, options);
+};
+
+FdSlicer.prototype.ref = function() {
+  this.refCount += 1;
+};
+
+FdSlicer.prototype.unref = function() {
+  var self = this;
+  self.refCount -= 1;
+  if (self.refCount < 0) throw new Error("invalid unref");
+  if (self.refCount > 0) return;
+
+  fs.close(self.fd, onCloseDone);
+
+  function onCloseDone(err) {
+    if (err) {
+      self.emit('error', err);
+    } else {
+      self.emit('close');
+    }
+  }
+};
+
+util.inherits(ReadStream, Readable);
+function ReadStream(context, options) {
+  options = options || {};
+  Readable.call(this, options);
+
+  this.context = context;
+  this.context.ref();
+
+  this.start = options.start || 0;
+  this.endOffset = options.end;
+  this.pos = this.start;
+}
+
+ReadStream.prototype._read = function(n) {
+  var self = this;
+
+  var toRead = Math.min(self._readableState.highWaterMark, n);
+  if (self.endOffset != null) {
+    toRead = Math.min(toRead, self.endOffset - self.pos);
+  }
+  if (toRead <= 0) {
+    self.push(null);
+    this._cleanup();
+    return;
+  }
+  self.context.pend.go(function(cb) {
+    var buffer = Buffer.allocUnsafe(toRead);
+    fs.read(self.context.fd, buffer, 0, toRead, self.pos, function(err, bytesRead) {
+      if (err) {
+        self.destroy(err);
+      } else if (bytesRead === 0) {
+        self.push(null);
+        self._cleanup();
+      } else {
+        self.pos += bytesRead;
+        self.push(buffer.slice(0, bytesRead));
+      }
+      cb();
+    });
+  });
+};
+
+ReadStream.prototype._destroy = function(err, cb) {
+  // Node 14+ calls this automatically at EOF.
+  this._cleanup();
+  cb(err);
+};
+
+ReadStream.prototype._cleanup = function() {
+  if (this.context != null) {
+    this.context.unref();
+    this.context = null;
+  }
+};
+
+util.inherits(BufferSlicer, EventEmitter);
+function BufferSlicer(buffer) {
+  EventEmitter.call(this);
+
+  this.refCount = 0;
+  this.buffer = buffer;
+}
+
+BufferSlicer.prototype.read = function(buffer, offset, length, position, callback) {
+  if (!(0 <= offset && offset <= buffer.length)) throw new RangeError("offset outside buffer: 0 <= " + offset + " <= " + buffer.length);
+  if (position < 0) throw new RangeError("position is negative: " + position);
+  if (offset + length > buffer.length) {
+    // The caller's buffer can't hold all the bytes they're trying to read.
+    // Clamp the length instead of giving an error.
+    // The callback will be informed of fewer than expected bytes written.
+    length = buffer.length - offset;
+  }
+  if (position + length > this.buffer.length) {
+    // Clamp any attempt to read past the end of the source buffer.
+    length = this.buffer.length - position;
+  }
+  if (length <= 0) {
+    // After any clamping, we're fully out of bounds or otherwise have nothing to do.
+    // This isn't an error; it's just zero bytes written.
+    setImmediate(function() {
+      callback(null, 0);
+    });
+    return;
+  }
+  this.buffer.copy(buffer, offset, position, position + length);
+  setImmediate(function() {
+    callback(null, length);
+  });
+};
+
+BufferSlicer.prototype.createReadStream = function(options) {
+  options = options || {};
+  var readStream = new PassThrough(options);
+  readStream.start = options.start || 0;
+  readStream.endOffset = options.end;
+  // by the time this function returns, we'll be done.
+  readStream.pos = readStream.endOffset || this.buffer.length;
+
+  var entireSlice = this.buffer.slice(readStream.start, readStream.pos);
+  // Cut the buffer into smaller slices for better memory usage when streaming into a zlib inflate stream.
+  // See https://github.com/thejoshwolfe/yauzl/issues/87
+  var maxChunkSize = 0x10000;
+  var offset = 0;
+  while (true) {
+    var nextOffset = offset + maxChunkSize;
+    if (nextOffset >= entireSlice.length) {
+      // last chunk
+      if (offset < entireSlice.length) {
+        readStream.write(entireSlice.slice(offset, entireSlice.length));
+      }
+      break;
+    }
+    readStream.write(entireSlice.slice(offset, nextOffset));
+    offset = nextOffset;
+  }
+
+  readStream.end();
+  return readStream;
+};
+
+BufferSlicer.prototype.ref = function() {
+  this.refCount += 1;
+};
+
+BufferSlicer.prototype.unref = function() {
+  this.refCount -= 1;
+
+  if (this.refCount < 0) {
+    throw new Error("invalid unref");
+  }
+};
+
+
+/***/ }),
+
+/***/ 5901:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+var fs = __nccwpck_require__(9896);
+var zlib = __nccwpck_require__(3106);
+var fd_slicer = __nccwpck_require__(3502);
+var util = __nccwpck_require__(9023);
+var EventEmitter = (__nccwpck_require__(4434).EventEmitter);
+var Transform = (__nccwpck_require__(2203).Transform);
+var PassThrough = (__nccwpck_require__(2203).PassThrough);
+var Writable = (__nccwpck_require__(2203).Writable);
+
+// Node 20 added zlib.crc32.
+const crc32 = typeof zlib.crc32 === "function" ? zlib.crc32 : __nccwpck_require__(4248);
+
+exports.open = open;
+exports.fromFd = fromFd;
+exports.fromBuffer = fromBuffer;
+exports.fromRandomAccessReader = fromRandomAccessReader;
+exports.openPromise = openPromise;
+exports.fromFdPromise = fromFdPromise;
+exports.fromBufferPromise = fromBufferPromise;
+exports.fromRandomAccessReaderPromise = fromRandomAccessReaderPromise;
+
+exports.dosDateTimeToDate = dosDateTimeToDate;
+exports.getFileNameLowLevel = getFileNameLowLevel;
+exports.validateFileName = validateFileName;
+exports.parseExtraFields = parseExtraFields;
+exports.ZipFile = ZipFile;
+exports.Entry = Entry;
+exports.LocalFileHeader = LocalFileHeader;
+exports.RandomAccessReader = RandomAccessReader;
+
+function openPromise(path, options) {
+  return new Promise((resolve, reject) => {
+    open(path, {...options, lazyEntries: true}, function(err, zipfile) {
+      if (err) return reject(err);
+      resolve(zipfile);
+    });
+  });
+}
+function fromFdPromise(fd, options) {
+  return new Promise((resolve, reject) => {
+    fromFd(fd, {...options, lazyEntries: true}, function(err, zipfile) {
+      if (err) return reject(err);
+      resolve(zipfile);
+    });
+  });
+}
+function fromBufferPromise(buffer, options) {
+  return new Promise((resolve, reject) => {
+    fromBuffer(buffer, {...options, lazyEntries: true}, function(err, zipfile) {
+      if (err) return reject(err);
+      resolve(zipfile);
+    });
+  });
+}
+function fromRandomAccessReaderPromise(reader, totalSize, options) {
+  return new Promise((resolve, reject) => {
+    fromRandomAccessReader(reader, totalSize, {...options, lazyEntries: true}, function(err, zipfile) {
+      if (err) return reject(err);
+      resolve(zipfile);
+    });
+  });
+}
+
+function open(path, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = null;
+  }
+  if (options == null) options = {};
+  if (options.autoClose == null) options.autoClose = true;
+  if (options.lazyEntries == null) options.lazyEntries = false;
+  if (options.decodeStrings == null) options.decodeStrings = true;
+  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
+  if (options.strictFileNames == null) options.strictFileNames = false;
+  if (callback == null) callback = defaultCallback;
+  fs.open(path, "r", function(err, fd) {
+    if (err) return callback(err);
+    fromFd(fd, options, function(err, zipfile) {
+      if (err) fs.close(fd, defaultCallback);
+      callback(err, zipfile);
+    });
+  });
+}
+
+function fromFd(fd, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = null;
+  }
+  if (options == null) options = {};
+  if (options.autoClose == null) options.autoClose = false;
+  if (options.lazyEntries == null) options.lazyEntries = false;
+  if (options.decodeStrings == null) options.decodeStrings = true;
+  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
+  if (options.strictFileNames == null) options.strictFileNames = false;
+  if (callback == null) callback = defaultCallback;
+  fs.fstat(fd, function(err, stats) {
+    if (err) return callback(err);
+    var reader = new fd_slicer.FdSlicer(fd);
+    fromRandomAccessReader(reader, stats.size, options, callback);
+  });
+}
+
+function fromBuffer(buffer, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = null;
+  }
+  if (options == null) options = {};
+  options.autoClose = false;
+  if (options.lazyEntries == null) options.lazyEntries = false;
+  if (options.decodeStrings == null) options.decodeStrings = true;
+  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
+  if (options.strictFileNames == null) options.strictFileNames = false;
+  var reader = new fd_slicer.BufferSlicer(buffer);
+  fromRandomAccessReader(reader, buffer.length, options, callback);
+}
+
+function fromRandomAccessReader(reader, totalSize, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = null;
+  }
+  if (options == null) options = {};
+  if (options.autoClose == null) options.autoClose = true;
+  if (options.lazyEntries == null) options.lazyEntries = false;
+  if (options.decodeStrings == null) options.decodeStrings = true;
+  var decodeStrings = !!options.decodeStrings;
+  if (options.validateEntrySizes == null) options.validateEntrySizes = true;
+  if (options.strictFileNames == null) options.strictFileNames = false;
+  if (callback == null) callback = defaultCallback;
+  if (typeof totalSize !== "number") throw new Error("expected totalSize parameter to be a number");
+  if (totalSize > Number.MAX_SAFE_INTEGER) {
+    throw new Error("zip file too large. only file sizes up to 2^52 are supported due to JavaScript's Number type being an IEEE 754 double.");
+  }
+
+  // the matching unref() call is in zipfile.close()
+  reader.ref();
+
+  // eocdr means End of Central Directory Record.
+  // search backwards for the eocdr signature.
+  // the last field of the eocdr is a variable-length comment.
+  // the comment size is encoded in a 2-byte field in the eocdr, which we can't find without trudging backwards through the comment to find it.
+  // as a consequence of this design decision, it's possible to have ambiguous zip file metadata if a coherent eocdr was in the comment.
+  // we search backwards for a eocdr signature, and hope that whoever made the zip file was smart enough to forbid the eocdr signature in the comment.
+  var eocdrWithoutCommentSize = 22;
+  var zip64EocdlSize = 20; // Zip64 end of central directory locator
+  var maxCommentSize = 0xffff; // 2-byte size
+  var bufferSize = Math.min(zip64EocdlSize + eocdrWithoutCommentSize + maxCommentSize, totalSize);
+  var buffer = newBuffer(bufferSize);
+  var bufferReadStart = totalSize - buffer.length;
+  readAndAssertNoEof(reader, buffer, 0, bufferSize, bufferReadStart, function(err) {
+    if (err) return callback(err);
+    for (var i = bufferSize - eocdrWithoutCommentSize; i >= 0; i -= 1) {
+      if (buffer.readUInt32LE(i) !== 0x06054b50) continue;
+      // found eocdr
+      var eocdrBuffer = buffer.subarray(i);
+
+      // 0 - End of central directory signature = 0x06054b50
+      // 4 - Number of this disk
+      var diskNumber = eocdrBuffer.readUInt16LE(4);
+      // 6 - Disk where central directory starts
+      // 8 - Number of central directory records on this disk
+      // 10 - Total number of central directory records
+      var entryCount = eocdrBuffer.readUInt16LE(10);
+      // 12 - Size of central directory (bytes)
+      // 16 - Offset of start of central directory, relative to start of archive
+      var centralDirectoryOffset = eocdrBuffer.readUInt32LE(16);
+      // 20 - Comment length
+      var commentLength = eocdrBuffer.readUInt16LE(20);
+      var expectedCommentLength = eocdrBuffer.length - eocdrWithoutCommentSize;
+      if (commentLength !== expectedCommentLength) {
+        return callback(new Error("Invalid comment length. Expected: " + expectedCommentLength + ". Found: " + commentLength + ". Are there extra bytes at the end of the file? Or is the end of central dir signature `PK☺☻` in the comment?"));
+      }
+      // 22 - Comment
+      // the encoding is always cp437.
+      var comment = decodeStrings ? decodeBuffer(eocdrBuffer.subarray(22), false)
+                                  : eocdrBuffer.subarray(22);
+
+      // Look for a Zip64 end of central directory locator
+      if (i - zip64EocdlSize >= 0 && buffer.readUInt32LE(i - zip64EocdlSize) === 0x07064b50) {
+        // ZIP64 format
+        var zip64EocdlBuffer = buffer.subarray(i - zip64EocdlSize, i - zip64EocdlSize + zip64EocdlSize);
+        // 0 - zip64 end of central dir locator signature = 0x07064b50
+        // 4 - number of the disk with the start of the zip64 end of central directory
+        // 8 - relative offset of the zip64 end of central directory record
+        var zip64EocdrOffset = readUInt64LE(zip64EocdlBuffer, 8);
+        // 16 - total number of disks
+
+        // ZIP64 end of central directory record
+        var zip64EocdrBuffer = newBuffer(56);
+        return readAndAssertNoEof(reader, zip64EocdrBuffer, 0, zip64EocdrBuffer.length, zip64EocdrOffset, function(err) {
+          if (err) return callback(err);
+
+          // 0 - zip64 end of central dir signature                           4 bytes  (0x06064b50)
+          if (zip64EocdrBuffer.readUInt32LE(0) !== 0x06064b50) {
+            return callback(new Error("invalid zip64 end of central directory record signature"));
+          }
+          // 4 - size of zip64 end of central directory record                8 bytes
+          // 12 - version made by                                             2 bytes
+          // 14 - version needed to extract                                   2 bytes
+          // 16 - number of this disk                                         4 bytes
+          diskNumber = zip64EocdrBuffer.readUInt32LE(16);
+          if (diskNumber !== 0) {
+            // Check this only after zip64 overrides. See #118.
+            return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
+          }
+          // 20 - number of the disk with the start of the central directory  4 bytes
+          // 24 - total number of entries in the central directory on this disk         8 bytes
+          // 32 - total number of entries in the central directory            8 bytes
+          entryCount = readUInt64LE(zip64EocdrBuffer, 32);
+          // 40 - size of the central directory                               8 bytes
+          // 48 - offset of start of central directory with respect to the starting disk number     8 bytes
+          centralDirectoryOffset = readUInt64LE(zip64EocdrBuffer, 48);
+          // 56 - zip64 extensible data sector                                (variable size)
+          return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+        });
+      }
+
+      // Not ZIP64 format
+      if (diskNumber !== 0) {
+        return callback(new Error("multi-disk zip files are not supported: found disk number: " + diskNumber));
+      }
+      return callback(null, new ZipFile(reader, centralDirectoryOffset, totalSize, entryCount, comment, options.autoClose, options.lazyEntries, decodeStrings, options.validateEntrySizes, options.strictFileNames));
+
+    }
+
+    // Not a zip file.
+    callback(new Error("End of central directory record signature not found. Either not a zip file, or file is truncated."));
+  });
+}
+
+util.inherits(ZipFile, EventEmitter);
+function ZipFile(reader, centralDirectoryOffset, fileSize, entryCount, comment, autoClose, lazyEntries, decodeStrings, validateEntrySizes, strictFileNames) {
+  var self = this;
+  EventEmitter.call(self);
+  self.reader = reader;
+  // forward close events
+  self.reader.on("error", function(err) {
+    // error closing the fd
+    emitError(self, err);
+  });
+  self.reader.once("close", function() {
+    self.emit("close");
+  });
+  self.readEntryCursor = centralDirectoryOffset;
+  self.fileSize = fileSize;
+  self.entryCount = entryCount;
+  self.comment = comment;
+  self.entriesRead = 0;
+  self.autoClose = !!autoClose;
+  self.lazyEntries = !!lazyEntries;
+  self.decodeStrings = !!decodeStrings;
+  self.validateEntrySizes = !!validateEntrySizes;
+  self.strictFileNames = !!strictFileNames;
+  self.isOpen = true;
+  self.emittedError = false;
+  self.hasEachEntryBeenCalled = false;
+
+  if (!self.lazyEntries) self._readEntry();
+}
+ZipFile.prototype.close = function() {
+  if (!this.isOpen) return;
+  this.isOpen = false;
+  this.reader.unref();
+};
+
+function emitErrorAndAutoClose(self, err) {
+  if (self.autoClose) self.close();
+  emitError(self, err);
+}
+function emitError(self, err) {
+  if (self.emittedError) return;
+  self.emittedError = true;
+  self.emit("error", err);
+}
+
+ZipFile.prototype.readEntry = function() {
+  if (!this.lazyEntries) throw new Error("readEntry() called without lazyEntries:true");
+  this._readEntry();
+};
+ZipFile.prototype._readEntry = function() {
+  var self = this;
+  if (self.entryCount === self.entriesRead) {
+    // done with metadata
+    setImmediate(function() {
+      if (self.autoClose) self.close();
+      if (self.emittedError) return;
+      self.emit("end");
+    });
+    return;
+  }
+  if (self.emittedError) return;
+  var buffer = newBuffer(46);
+  readAndAssertNoEof(self.reader, buffer, 0, buffer.length, self.readEntryCursor, function(err) {
+    if (err) return emitErrorAndAutoClose(self, err);
+    if (self.emittedError) return;
+    var entry = new Entry();
+    // 0 - Central directory file header signature
+    var signature = buffer.readUInt32LE(0);
+    if (signature !== 0x02014b50) return emitErrorAndAutoClose(self, new Error("invalid central directory file header signature: 0x" + signature.toString(16)));
+    // 4 - Version made by
+    entry.versionMadeBy = buffer.readUInt16LE(4);
+    // 6 - Version needed to extract (minimum)
+    entry.versionNeededToExtract = buffer.readUInt16LE(6);
+    // 8 - General purpose bit flag
+    entry.generalPurposeBitFlag = buffer.readUInt16LE(8);
+    // 10 - Compression method
+    entry.compressionMethod = buffer.readUInt16LE(10);
+    // 12 - File last modification time
+    entry.lastModFileTime = buffer.readUInt16LE(12);
+    // 14 - File last modification date
+    entry.lastModFileDate = buffer.readUInt16LE(14);
+    // 16 - CRC-32
+    entry.crc32 = buffer.readUInt32LE(16);
+    // 20 - Compressed size
+    entry.compressedSize = buffer.readUInt32LE(20);
+    // 24 - Uncompressed size
+    entry.uncompressedSize = buffer.readUInt32LE(24);
+    // 28 - File name length (n)
+    entry.fileNameLength = buffer.readUInt16LE(28);
+    // 30 - Extra field length (m)
+    entry.extraFieldLength = buffer.readUInt16LE(30);
+    // 32 - File comment length (k)
+    entry.fileCommentLength = buffer.readUInt16LE(32);
+    // 34 - Disk number where file starts
+    // 36 - Internal file attributes
+    entry.internalFileAttributes = buffer.readUInt16LE(36);
+    // 38 - External file attributes
+    entry.externalFileAttributes = buffer.readUInt32LE(38);
+    // 42 - Relative offset of local file header
+    entry.relativeOffsetOfLocalHeader = buffer.readUInt32LE(42);
+
+    if (entry.generalPurposeBitFlag & 0x40) return emitErrorAndAutoClose(self, new Error("strong encryption is not supported"));
+
+    self.readEntryCursor += 46;
+
+    buffer = newBuffer(entry.fileNameLength + entry.extraFieldLength + entry.fileCommentLength);
+    readAndAssertNoEof(self.reader, buffer, 0, buffer.length, self.readEntryCursor, function(err) {
+      if (err) return emitErrorAndAutoClose(self, err);
+      if (self.emittedError) return;
+      // 46 - File name
+      entry.fileNameRaw = buffer.subarray(0, entry.fileNameLength);
+      // 46+n - Extra field
+      var fileCommentStart = entry.fileNameLength + entry.extraFieldLength;
+      entry.extraFieldRaw = buffer.subarray(entry.fileNameLength, fileCommentStart);
+      // 46+n+m - File comment
+      entry.fileCommentRaw = buffer.subarray(fileCommentStart, fileCommentStart + entry.fileCommentLength);
+
+      // Parse the extra fields, which we need for processing other fields.
+      try {
+        entry.extraFields = parseExtraFields(entry.extraFieldRaw);
+      } catch (err) {
+        return emitErrorAndAutoClose(self, err);
+      }
+
+      // Interpret strings according to bit flags, extra fields, and options.
+      if (self.decodeStrings) {
+        var isUtf8 = (entry.generalPurposeBitFlag & 0x800) !== 0;
+        entry.fileComment = decodeBuffer(entry.fileCommentRaw, isUtf8);
+        entry.fileName = getFileNameLowLevel(entry.generalPurposeBitFlag, entry.fileNameRaw, entry.extraFields, self.strictFileNames);
+        var errorMessage = validateFileName(entry.fileName);
+        if (errorMessage != null) return emitErrorAndAutoClose(self, new Error(errorMessage));
+      } else {
+        entry.fileComment = entry.fileCommentRaw;
+        entry.fileName = entry.fileNameRaw;
+      }
+      // Maintain API compatibility. See https://github.com/thejoshwolfe/yauzl/issues/47
+      entry.comment = entry.fileComment;
+
+      self.readEntryCursor += buffer.length;
+      self.entriesRead += 1;
+
+      // Check for the Zip64 Extended Information Extra Field.
+      for (var i = 0; i < entry.extraFields.length; i++) {
+        var extraField = entry.extraFields[i];
+        if (extraField.id !== 0x0001) continue;
+        // Found it.
+
+        var zip64EiefBuffer = extraField.data;
+        var index = 0;
+        // 0 - Original Size          8 bytes
+        if (entry.uncompressedSize === 0xffffffff) {
+          if (index + 8 > zip64EiefBuffer.length) {
+            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include uncompressed size"));
+          }
+          entry.uncompressedSize = readUInt64LE(zip64EiefBuffer, index);
+          index += 8;
+        }
+        // 8 - Compressed Size        8 bytes
+        if (entry.compressedSize === 0xffffffff) {
+          if (index + 8 > zip64EiefBuffer.length) {
+            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include compressed size"));
+          }
+          entry.compressedSize = readUInt64LE(zip64EiefBuffer, index);
+          index += 8;
+        }
+        // 16 - Relative Header Offset 8 bytes
+        if (entry.relativeOffsetOfLocalHeader === 0xffffffff) {
+          if (index + 8 > zip64EiefBuffer.length) {
+            return emitErrorAndAutoClose(self, new Error("zip64 extended information extra field does not include relative header offset"));
+          }
+          entry.relativeOffsetOfLocalHeader = readUInt64LE(zip64EiefBuffer, index);
+          index += 8;
+        }
+        // 24 - Disk Start Number      4 bytes
+
+        break;
+      }
+
+      // validate file size
+      if (self.validateEntrySizes && entry.compressionMethod === 0) {
+        var expectedCompressedSize = entry.uncompressedSize;
+        if (entry.isEncrypted()) {
+          // traditional encryption prefixes the file data with a header
+          expectedCompressedSize += 12;
+        }
+        if (entry.compressedSize !== expectedCompressedSize) {
+          var msg = "compressed/uncompressed size mismatch for stored file: " + entry.compressedSize + " != " + entry.uncompressedSize;
+          return emitErrorAndAutoClose(self, new Error(msg));
+        }
+      }
+
+      self.emit("entry", entry);
+
+      if (!self.lazyEntries) self._readEntry();
+    });
+  });
+};
+
+ZipFile.prototype.eachEntry = function() {
+  const self = this;
+  if (!self.lazyEntries) throw new Error("eachEntry() requires lazyEntries: true");
+  if (self.hasEachEntryBeenCalled) throw new Error("eachEntry() must only be called once per ZipFile");
+  self.hasEachEntryBeenCalled = true;
+
+  let pendingResolveReject = null;
+  self.on("entry", onEntry);
+  self.on("end", onEnd);
+  self.on("error", onError);
+  function cleanup() {
+    self.removeListener("entry", onEntry);
+    self.removeListener("end", onEnd);
+    self.removeListener("error", onError);
+    if (self.autoClose) self.close();
+  }
+
+  function onEntry(entry) {
+    let {resolve} = pendingResolveReject;
+    pendingResolveReject = null;
+    resolve({value: entry});
+  }
+  function onEnd() {
+    let {resolve} = pendingResolveReject;
+    pendingResolveReject = null;
+    cleanup();
+    resolve({done: true});
+  }
+  function onError(err) {
+    let {reject} = pendingResolveReject;
+    pendingResolveReject = null;
+    cleanup();
+    reject(err);
+  }
+
+  return {
+    [Symbol.asyncIterator]() {
+      // Called once by `for await...of`.
+      return this;
+    },
+    next() {
+      // Called on each iteration in a `for await...of`.
+      const promise = new Promise((resolve, reject) => {
+        if (pendingResolveReject != null) throw new Error("next() called before previous Promise was resolved.");
+        pendingResolveReject = {resolve, reject};
+      });
+      self.readEntry();
+      return promise;
+    },
+    return(value) {
+      // Called when breaking, returning, throwing out of a `for await...of`.
+      cleanup();
+      return Promise.resolve({done: true, value});
+    },
+    throw(value) {
+      // Almost never called. Something about `yield*` maybe?
+      cleanup();
+      return Promise.reject(value);
+    },
+  };
+};
+
+ZipFile.prototype.openReadStream = function(entry, options, callback) {
+  var self = this;
+  // parameter validation
+  var relativeStart = 0;
+  var relativeEnd = entry.compressedSize;
+  if (callback == null) {
+    callback = options;
+    options = null;
+  }
+  if (options == null) {
+    options = {};
+  } else {
+    if (options.decodeFileData === false) {
+      // new, simple option
+      if (options.decrypt != null) {
+        throw new Error("cannot use options.decrypt when options.decodeFileData === false");
+      }
+      if (options.decompress != null) {
+        throw new Error("cannot use options.decompress when options.decodeFileData === false");
+      }
+      // start and end are allowed
+    } else {
+      // old, complicated options
+      if (options.decrypt != null) {
+        if (!entry.isEncrypted()) {
+          throw new Error("options.decrypt can only be specified for encrypted entries. See also option decodeFileData.");
+        }
+        if (options.decrypt !== false) throw new Error("invalid options.decrypt value: " + options.decrypt);
+        if (entry.isCompressed()) {
+          if (options.decompress !== false) throw new Error("entry is encrypted and compressed, and options.decompress !== false. See also option decodeFileData.");
+        }
+      }
+      if (options.decompress != null) {
+        if (!entry.isCompressed()) {
+          throw new Error("options.decompress can only be specified for compressed entries. See also option decodeFileData.");
+        }
+        if (!(options.decompress === false || options.decompress === true)) {
+          throw new Error("invalid options.decompress value: " + options.decompress);
+        }
+        decompress = options.decompress;
+      }
+    }
+    if (options.start != null) {
+      relativeStart = options.start;
+      if (relativeStart < 0) throw new Error("options.start < 0");
+      if (relativeStart > entry.compressedSize) throw new Error("options.start > entry.compressedSize");
+    }
+    if (options.end != null) {
+      relativeEnd = options.end;
+      if (relativeEnd < 0) throw new Error("options.end < 0");
+      if (relativeEnd > entry.compressedSize) throw new Error("options.end > entry.compressedSize");
+      if (relativeEnd < relativeStart) throw new Error("options.end < options.start");
+    }
+  }
+  var rawMode = (
+    options.decodeFileData === false || // Explicitly requested raw.
+    (
+      (entry.compressionMethod === 0 || // Naturally without compression.
+        (entry.compressionMethod === 8 && options.decompress === false) // Deprecated compression bypass option.
+      ) &&
+      (!entry.isEncrypted() || // Naturally without encryption.
+        options.decrypt === false // Deprecated encryption bypass option.
+      )
+    )
+  );
+  if (options.start != null || options.end != null) {
+    // Ensure slicing deals with raw data.
+    if (!rawMode) throw new Error("start/end range require options.decodeFileData === false for non-trivial encoded entries.");
+  }
+
+  // any further errors can either be caused by the zipfile,
+  // or were introduced in a minor version of yauzl,
+  // so should be passed to the client rather than thrown.
+  if (!self.isOpen) return callback(new Error("closed"));
+  if (entry.isEncrypted() && !rawMode) {
+    if (options.decrypt !== false) return callback(new Error("entry is encrypted, and options.decodeFileData !== false"));
+  }
+  var decompress;
+  if (rawMode) {
+    decompress = false;
+  } else if (entry.compressionMethod === 8) {
+    // 8 - The file is Deflated
+    decompress = options.decodeFileData !== true;
+  } else {
+    return callback(new Error("unsupported compression method: " + entry.compressionMethod));
+  }
+
+  self.readLocalFileHeader(entry, {minimal: true}, function(err, localFileHeader) {
+    if (err) return callback(err);
+    self.openReadStreamLowLevel(
+      localFileHeader.fileDataStart, entry.compressedSize,
+      relativeStart, relativeEnd,
+      decompress, entry.uncompressedSize,
+      callback);
+  });
+};
+
+ZipFile.prototype.openReadStreamLowLevel = function(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, callback) {
+  var self = this;
+
+  var fileDataEnd = fileDataStart + compressedSize;
+  var readStream = self.reader.createReadStream({
+    start: fileDataStart + relativeStart,
+    end: fileDataStart + relativeEnd,
+  });
+  var endpointStream = readStream;
+  if (decompress) {
+    var destroyed = false;
+    var inflateFilter = zlib.createInflateRaw();
+    readStream.on("error", function(err) {
+      // setImmediate here because errors can be emitted during the first call to pipe()
+      setImmediate(function() {
+        if (!destroyed) inflateFilter.emit("error", err);
+      });
+    });
+    readStream.pipe(inflateFilter);
+
+    if (self.validateEntrySizes) {
+      endpointStream = new AssertByteCountStream(uncompressedSize);
+      inflateFilter.on("error", function(err) {
+        // forward zlib errors to the client-visible stream
+        setImmediate(function() {
+          if (!destroyed) endpointStream.emit("error", err);
+        });
+      });
+      inflateFilter.pipe(endpointStream);
+    } else {
+      // the zlib filter is the client-visible stream
+      endpointStream = inflateFilter;
+    }
+    // this is part of yauzl's API, so implement this function on the client-visible stream
+    installDestroyFn(endpointStream, function() {
+      destroyed = true;
+      if (inflateFilter !== endpointStream) inflateFilter.unpipe(endpointStream);
+      readStream.unpipe(inflateFilter);
+      // TODO: the inflateFilter may cause a memory leak. see Issue #27.
+      readStream.destroy();
+    });
+  }
+  callback(null, endpointStream);
+};
+
+ZipFile.prototype.readLocalFileHeader = function(entry, options, callback) {
+  var self = this;
+  if (callback == null) {
+    callback = options;
+    options = null;
+  }
+  if (options == null) options = {};
+
+  self.reader.ref();
+  var buffer = newBuffer(30);
+  readAndAssertNoEof(self.reader, buffer, 0, buffer.length, entry.relativeOffsetOfLocalHeader, function(err) {
+    try {
+      if (err) return callback(err);
+      // 0 - Local file header signature = 0x04034b50
+      var signature = buffer.readUInt32LE(0);
+      if (signature !== 0x04034b50) {
+        return callback(new Error("invalid local file header signature: 0x" + signature.toString(16)));
+      }
+
+      var fileNameLength = buffer.readUInt16LE(26);
+      var extraFieldLength = buffer.readUInt16LE(28);
+      var fileDataStart = entry.relativeOffsetOfLocalHeader + 30 + fileNameLength + extraFieldLength;
+      // We now have enough information to do this bounds check.
+      if (fileDataStart + entry.compressedSize > self.fileSize) {
+        return callback(new Error("file data overflows file bounds: " +
+            fileDataStart + " + " + entry.compressedSize + " > " + self.fileSize));
+      }
+
+      if (options.minimal) {
+        return callback(null, {fileDataStart: fileDataStart});
+      }
+
+      var localFileHeader = new LocalFileHeader();
+      localFileHeader.fileDataStart = fileDataStart;
+
+      // 4 - Version needed to extract (minimum)
+      localFileHeader.versionNeededToExtract = buffer.readUInt16LE(4);
+      // 6 - General purpose bit flag
+      localFileHeader.generalPurposeBitFlag = buffer.readUInt16LE(6);
+      // 8 - Compression method
+      localFileHeader.compressionMethod = buffer.readUInt16LE(8);
+      // 10 - File last modification time
+      localFileHeader.lastModFileTime = buffer.readUInt16LE(10);
+      // 12 - File last modification date
+      localFileHeader.lastModFileDate = buffer.readUInt16LE(12);
+      // 14 - CRC-32
+      localFileHeader.crc32 = buffer.readUInt32LE(14);
+      // 18 - Compressed size
+      localFileHeader.compressedSize = buffer.readUInt32LE(18);
+      // 22 - Uncompressed size
+      localFileHeader.uncompressedSize = buffer.readUInt32LE(22);
+      // 26 - File name length (n)
+      localFileHeader.fileNameLength = fileNameLength;
+      // 28 - Extra field length (m)
+      localFileHeader.extraFieldLength = extraFieldLength;
+      // 30 - File name
+      // 30+n - Extra field
+
+      buffer = newBuffer(fileNameLength + extraFieldLength);
+      self.reader.ref();
+      readAndAssertNoEof(self.reader, buffer, 0, buffer.length, entry.relativeOffsetOfLocalHeader + 30, function(err) {
+        try {
+          if (err) return callback(err);
+          localFileHeader.fileName = buffer.subarray(0, fileNameLength);
+          localFileHeader.extraField = buffer.subarray(fileNameLength);
+          return callback(null, localFileHeader);
+        } finally {
+          self.reader.unref();
+        }
+      });
+    } finally {
+      self.reader.unref();
+    }
+  });
+};
+
+ZipFile.prototype.openReadStreamPromise = function(entry, options) {
+  return new Promise((resolve, reject) => {
+    this.openReadStream(entry, options, function(err, readStream) {
+      if (err) return reject(err);
+      resolve(readStream);
+    });
+  });
+};
+ZipFile.prototype.openReadStreamLowLevelPromise = function(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize) {
+  return new Promise((resolve, reject) => {
+    this.openReadStream(fileDataStart, compressedSize, relativeStart, relativeEnd, decompress, uncompressedSize, function(err, readStream) {
+      if (err) return reject(err);
+      resolve(readStream);
+    });
+  });
+};
+ZipFile.prototype.readLocalFileHeaderPromise = function(entry, options) {
+  return new Promise((resolve, reject) => {
+    this.readLocalFileHeader(entry, options, function(err, localFileHeader) {
+      if (err) return reject(err);
+      resolve(localFileHeader);
+    });
+  });
+};
+
+function Entry() {
+}
+Entry.prototype.getLastModDate = function(options) {
+  if (options == null) options = {};
+
+  if (!options.forceDosFormat) {
+    // Check extended fields.
+    for (var i = 0; i < this.extraFields.length; i++) {
+      var extraField = this.extraFields[i];
+      if (extraField.id === 0x5455) {
+        // Info-ZIP "universal timestamp" extended field (`0x5455` aka `"UT"`).
+        // See the Info-ZIP source code unix/unix.c:set_extra_field() and zipfile.c:ef_scan_ut_time().
+        var data = extraField.data;
+        if (data.length < 5) continue; // Too short.
+        // The flags define which of the three fields are present: mtime, atime, ctime.
+        // We only care about mtime.
+        // Also, ctime is never included in practice.
+        // And also, atime is only included in the local file header for some reason
+        // despite the flags lying about its inclusion in the central header.
+        var flags = data[0];
+        var HAS_MTIME = 1;
+        if (!(flags & HAS_MTIME)) continue; // This will realistically never happen.
+        // Although the positions of all of the fields shift around depending on the presence of other fields,
+        // mtime is always first if present, and that's the only one we care about.
+        var posixTimestamp = data.readInt32LE(1);
+        return new Date(posixTimestamp * 1000);
+      } else if (extraField.id === 0x000a) {
+        var data = extraField.data;
+        if (data.length !== 32) continue; // The length is always the same.
+        // 4 bytes reserved
+        // 2 bytes Tag
+        if (data.readUInt16LE(4) !== 1) continue; // Tag1 is actually the only defined Tag.
+        // 2 bytes Size
+        if (data.readUInt16LE(6) !== 24) continue; // Size is always 24.
+        // 8 bytes Mtime
+        var hundredNanoSecondsSince1601 = data.readUInt32LE(8) + 4294967296 * data.readInt32LE(12);
+        // Convert from NTFS to POSIX milliseconds.
+        // The big number below is the milliseconds between year 1601 and year 1970
+        // (i.e. the negative POSIX timestamp of 1601-01-01 00:00:00Z)
+        var millisecondsSince1970 = hundredNanoSecondsSince1601 / 10000 - 11644473600000;
+        // Note on numeric precision: JavaScript Number objects lose precision above Number.MAX_SAFE_INTEGER,
+        // and NTFS timestamps are typically much bigger than that limit.
+        // (MAX_SAFE_INTEGER would represent 1629-07-17T23:58:45.475Z.)
+        // However, we're losing precision in the conversion from 100nanosecond units to millisecond units anyway,
+        // and the time at which we also lose 1-millisecond precision is year 275760, the JavaScript Date limit (by design).
+        // Up through the year 2057, this conversion only drops 4 bits of precision,
+        // which is well under the 13-14 bits ratio between the milliseconds and 100nanoseconds.
+        return new Date(millisecondsSince1970);
+      }
+    }
+  }
+
+  // Fallback to non-extended encoding.
+  return dosDateTimeToDate(this.lastModFileDate, this.lastModFileTime, options.timezone);
+};
+
+Entry.prototype.canDecodeFileData = function() {
+  return (
+    !this.isEncrypted() &&
+    (this.compressionMethod === 0 || this.compressionMethod === 8)
+  );
+};
+Entry.prototype.isEncrypted = function() {
+  return (this.generalPurposeBitFlag & 0x1) !== 0;
+};
+Entry.prototype.isCompressed = function() {
+  return this.compressionMethod === 8;
+};
+
+function LocalFileHeader() {
+}
+
+function dosDateTimeToDate(date, time, timezone) {
+  var day = date & 0x1f; // 1-31
+  var month = (date >> 5 & 0xf) - 1; // 1-12, 0-11
+  var year = (date >> 9 & 0x7f) + 1980; // 0-128, 1980-2108
+
+  var millisecond = 0;
+  var second = (time & 0x1f) * 2; // 0-29, 0-58 (even numbers)
+  var minute = time >> 5 & 0x3f; // 0-59
+  var hour = time >> 11 & 0x1f; // 0-23
+
+  if (timezone == null || timezone === "local") {
+    return new Date(year, month, day, hour, minute, second, millisecond);
+  } else if (timezone === "UTC") {
+    return new Date(Date.UTC(year, month, day, hour, minute, second, millisecond));
+  } else {
+    throw new Error("unrecognized options.timezone: " + options.timezone);
+  }
+}
+
+function getFileNameLowLevel(generalPurposeBitFlag, fileNameBuffer, extraFields, strictFileNames) {
+  var fileName = null;
+
+  // check for Info-ZIP Unicode Path Extra Field (0x7075)
+  // see https://github.com/thejoshwolfe/yauzl/issues/33
+  for (var i = 0; i < extraFields.length; i++) {
+    var extraField = extraFields[i];
+    if (extraField.id === 0x7075) {
+      if (extraField.data.length < 6) {
+        // too short to be meaningful
+        continue;
+      }
+      // Version       1 byte      version of this extra field, currently 1
+      if (extraField.data.readUInt8(0) !== 1) {
+        // > Changes may not be backward compatible so this extra
+        // > field should not be used if the version is not recognized.
+        continue;
+      }
+      // NameCRC32     4 bytes     File Name Field CRC32 Checksum
+      var oldNameCrc32 = extraField.data.readUInt32LE(1);
+      if (crc32(fileNameBuffer) !== oldNameCrc32) {
+        // > If the CRC check fails, this UTF-8 Path Extra Field should be
+        // > ignored and the File Name field in the header should be used instead.
+        continue;
+      }
+      // UnicodeName   Variable    UTF-8 version of the entry File Name
+      fileName = decodeBuffer(extraField.data.subarray(5), true);
+      break;
+    }
+  }
+
+  if (fileName == null) {
+    // The typical case.
+    var isUtf8 = (generalPurposeBitFlag & 0x800) !== 0;
+    fileName = decodeBuffer(fileNameBuffer, isUtf8);
+  }
+
+  if (!strictFileNames) {
+    // Allow backslash.
+    fileName = fileName.replace(/\\/g, "/");
+  }
+  return fileName;
+}
+
+function validateFileName(fileName) {
+  if (fileName.indexOf("\\") !== -1) {
+    return "invalid characters in fileName: " + fileName;
+  }
+  if (/^[a-zA-Z]:/.test(fileName) || /^\//.test(fileName)) {
+    return "absolute path: " + fileName;
+  }
+  if (fileName.split("/").indexOf("..") !== -1) {
+    return "invalid relative path: " + fileName;
+  }
+  // all good
+  return null;
+}
+
+function parseExtraFields(extraFieldBuffer) {
+  var extraFields = [];
+  var i = 0;
+  while (i < extraFieldBuffer.length - 3) {
+    var headerId = extraFieldBuffer.readUInt16LE(i + 0);
+    var dataSize = extraFieldBuffer.readUInt16LE(i + 2);
+    var dataStart = i + 4;
+    var dataEnd = dataStart + dataSize;
+    if (dataEnd > extraFieldBuffer.length) throw new Error("extra field length exceeds extra field buffer size");
+    var dataBuffer = extraFieldBuffer.subarray(dataStart, dataEnd);
+    extraFields.push({
+      id: headerId,
+      data: dataBuffer,
+    });
+    i = dataEnd;
+  }
+  return extraFields;
+}
+
+function readAndAssertNoEof(reader, buffer, offset, length, position, callback) {
+  if (length === 0) {
+    // fs.read will throw an out-of-bounds error if you try to read 0 bytes from a 0 byte file
+    return setImmediate(function() { callback(null, newBuffer(0)); });
+  }
+  reader.read(buffer, offset, length, position, function(err, bytesRead) {
+    if (err) return callback(err);
+    if (bytesRead < length) {
+      return callback(new Error("unexpected EOF"));
+    }
+    callback();
+  });
+}
+
+util.inherits(AssertByteCountStream, Transform);
+function AssertByteCountStream(byteCount) {
+  Transform.call(this);
+  this.actualByteCount = 0;
+  this.expectedByteCount = byteCount;
+}
+AssertByteCountStream.prototype._transform = function(chunk, encoding, cb) {
+  this.actualByteCount += chunk.length;
+  if (this.actualByteCount > this.expectedByteCount) {
+    var msg = "too many bytes in the stream. expected " + this.expectedByteCount + ". got at least " + this.actualByteCount;
+    return cb(new Error(msg));
+  }
+  cb(null, chunk);
+};
+AssertByteCountStream.prototype._flush = function(cb) {
+  if (this.actualByteCount < this.expectedByteCount) {
+    var msg = "not enough bytes in the stream. expected " + this.expectedByteCount + ". got only " + this.actualByteCount;
+    return cb(new Error(msg));
+  }
+  cb();
+};
+
+util.inherits(RandomAccessReader, EventEmitter);
+function RandomAccessReader() {
+  EventEmitter.call(this);
+  this.refCount = 0;
+}
+RandomAccessReader.prototype.ref = function() {
+  this.refCount += 1;
+};
+RandomAccessReader.prototype.unref = function() {
+  var self = this;
+  self.refCount -= 1;
+
+  if (self.refCount > 0) return;
+  if (self.refCount < 0) throw new Error("invalid unref");
+
+  self.close(onCloseDone);
+
+  function onCloseDone(err) {
+    if (err) return self.emit('error', err);
+    self.emit('close');
+  }
+};
+RandomAccessReader.prototype.createReadStream = function(options) {
+  if (options == null) options = {};
+  var start = options.start;
+  var end = options.end;
+  if (start === end) {
+    var emptyStream = new PassThrough();
+    setImmediate(function() {
+      emptyStream.end();
+    });
+    return emptyStream;
+  }
+  var stream = this._readStreamForRange(start, end);
+
+  var destroyed = false;
+  var refUnrefFilter = new RefUnrefFilter(this);
+  stream.on("error", function(err) {
+    setImmediate(function() {
+      if (!destroyed) refUnrefFilter.emit("error", err);
+    });
+  });
+  installDestroyFn(refUnrefFilter, function() {
+    stream.unpipe(refUnrefFilter);
+    refUnrefFilter.unref();
+    stream.destroy();
+  });
+
+  var byteCounter = new AssertByteCountStream(end - start);
+  refUnrefFilter.on("error", function(err) {
+    setImmediate(function() {
+      if (!destroyed) byteCounter.emit("error", err);
+    });
+  });
+  installDestroyFn(byteCounter, function() {
+    destroyed = true;
+    refUnrefFilter.unpipe(byteCounter);
+    refUnrefFilter.destroy();
+  });
+
+  return stream.pipe(refUnrefFilter).pipe(byteCounter);
+};
+RandomAccessReader.prototype._readStreamForRange = function(start, end) {
+  throw new Error("not implemented");
+};
+RandomAccessReader.prototype.read = function(buffer, offset, length, position, callback) {
+  var readStream = this.createReadStream({start: position, end: position + length});
+  var writeStream = new Writable();
+  var written = 0;
+  writeStream._write = function(chunk, encoding, cb) {
+    chunk.copy(buffer, offset + written, 0, chunk.length);
+    written += chunk.length;
+    cb();
+  };
+  writeStream.on("finish", callback);
+  readStream.on("error", function(error) {
+    callback(error);
+  });
+  readStream.pipe(writeStream);
+};
+RandomAccessReader.prototype.close = function(callback) {
+  setImmediate(callback);
+};
+
+util.inherits(RefUnrefFilter, PassThrough);
+function RefUnrefFilter(context) {
+  PassThrough.call(this);
+  this.context = context;
+  this.context.ref();
+  this.unreffedYet = false;
+}
+RefUnrefFilter.prototype._flush = function(cb) {
+  this.unref();
+  cb();
+};
+RefUnrefFilter.prototype.unref = function(cb) {
+  if (this.unreffedYet) return;
+  this.unreffedYet = true;
+  this.context.unref();
+};
+
+var cp437 = '\u0000☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼ !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
+function decodeBuffer(buffer, isUtf8) {
+  if (isUtf8) {
+    return buffer.toString("utf8");
+  } else {
+    var result = "";
+    for (var i = 0; i < buffer.length; i++) {
+      result += cp437[buffer[i]];
+    }
+    return result;
+  }
+}
+
+function readUInt64LE(buffer, offset) {
+  // There is no native function for this, because we can't actually store 64-bit integers precisely.
+  // after 53 bits, JavaScript's Number type (IEEE 754 double) can't store individual integers anymore.
+  // but since 53 bits is a whole lot more than 32 bits, we do our best anyway.
+  // As of 2020, Node has added support for BigInt, which obviates this whole function,
+  // but yauzl hasn't been updated to depend on BigInt (yet?).
+  var lower32 = buffer.readUInt32LE(offset);
+  var upper32 = buffer.readUInt32LE(offset + 4);
+  // we can't use bitshifting here, because JavaScript bitshifting only works on 32-bit integers.
+  return upper32 * 0x100000000 + lower32;
+  // as long as we're bounds checking the result of this function against the total file size,
+  // we'll catch any overflow errors, because we already made sure the total file size was within reason.
+}
+
+// Node 10 deprecated new Buffer().
+var newBuffer;
+if (typeof Buffer.allocUnsafe === "function") {
+  newBuffer = function(len) {
+    return Buffer.allocUnsafe(len);
+  };
+} else {
+  newBuffer = function(len) {
+    return new Buffer(len);
+  };
+}
+
+// Node 8 introduced a proper destroy() implementation on writable streams.
+function installDestroyFn(stream, fn) {
+  if (typeof stream.destroy === "function") {
+    // New API.
+    stream._destroy = function(err, cb) {
+      fn();
+      if (cb != null) cb(err);
+    };
+  } else {
+    // Old API.
+    stream.destroy = fn;
+  }
+}
+
+function defaultCallback(err) {
+  if (err) throw err;
+}
+
+
+/***/ }),
+
 /***/ 3044:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -71394,7 +71510,8 @@ var PassThrough = (__nccwpck_require__(2203).PassThrough);
 var zlib = __nccwpck_require__(3106);
 var util = __nccwpck_require__(9023);
 var EventEmitter = (__nccwpck_require__(4434).EventEmitter);
-var crc32 = __nccwpck_require__(9776);
+var errorMonitor = (__nccwpck_require__(4434).errorMonitor);
+var crc32 = __nccwpck_require__(4928);
 
 exports.ZipFile = ZipFile;
 exports.dateToDosDateTime = dateToDosDateTime;
@@ -71407,6 +71524,10 @@ function ZipFile() {
   this.ended = false; // .end() sets this
   this.allDone = false; // set when we've written the last bytes
   this.forceZip64Eocd = false; // configurable in .end()
+  this.errored = false;
+  this.on(errorMonitor, function() {
+    this.errored = true;
+  });
 }
 
 ZipFile.prototype.addFile = function(realPath, metadataPath, options) {
@@ -71414,6 +71535,7 @@ ZipFile.prototype.addFile = function(realPath, metadataPath, options) {
   metadataPath = validateMetadataPath(metadataPath, false);
   if (options == null) options = {};
 
+  if (shouldIgnoreAdding(self)) return;
   var entry = new Entry(metadataPath, false, options);
   self.entries.push(entry);
   fs.stat(realPath, function(err, stats) {
@@ -71435,14 +71557,29 @@ ZipFile.prototype.addFile = function(realPath, metadataPath, options) {
 };
 
 ZipFile.prototype.addReadStream = function(readStream, metadataPath, options) {
+  this.addReadStreamLazy(metadataPath, options, function(cb) {
+    cb(null, readStream);
+  });
+};
+
+ZipFile.prototype.addReadStreamLazy = function(metadataPath, options, getReadStreamFunction) {
   var self = this;
-  metadataPath = validateMetadataPath(metadataPath, false);
+  if (typeof options === "function") {
+    getReadStreamFunction = options;
+    options = null;
+  }
   if (options == null) options = {};
+  metadataPath = validateMetadataPath(metadataPath, false);
+
+  if (shouldIgnoreAdding(self)) return;
   var entry = new Entry(metadataPath, false, options);
   self.entries.push(entry);
   entry.setFileDataPumpFunction(function() {
     entry.state = Entry.FILE_DATA_IN_PROGRESS;
-    pumpFileDataReadStream(self, entry, readStream);
+    getReadStreamFunction(function(err, readStream) {
+      if (err) return self.emit("error", err);
+      pumpFileDataReadStream(self, entry, readStream);
+    });
   });
   pumpEntries(self);
 };
@@ -71453,15 +71590,17 @@ ZipFile.prototype.addBuffer = function(buffer, metadataPath, options) {
   if (buffer.length > 0x3fffffff) throw new Error("buffer too large: " + buffer.length + " > " + 0x3fffffff);
   if (options == null) options = {};
   if (options.size != null) throw new Error("options.size not allowed");
+
+  if (shouldIgnoreAdding(self)) return;
   var entry = new Entry(metadataPath, false, options);
   entry.uncompressedSize = buffer.length;
   entry.crc32 = crc32.unsigned(buffer);
   entry.crcAndFileSizeKnown = true;
   self.entries.push(entry);
-  if (!entry.compress) {
+  if (entry.compressionLevel === 0) {
     setCompressedBuffer(buffer);
   } else {
-    zlib.deflateRaw(buffer, function(err, compressedBuffer) {
+    zlib.deflateRaw(buffer, {level:entry.compressionLevel}, function(err, compressedBuffer) {
       setCompressedBuffer(compressedBuffer);
     });
   }
@@ -71488,6 +71627,9 @@ ZipFile.prototype.addEmptyDirectory = function(metadataPath, options) {
   if (options == null) options = {};
   if (options.size != null) throw new Error("options.size not allowed");
   if (options.compress != null) throw new Error("options.compress not allowed");
+  if (options.compressionLevel != null) throw new Error("options.compressionLevel not allowed");
+
+  if (shouldIgnoreAdding(self)) return;
   var entry = new Entry(metadataPath, true, options);
   self.entries.push(entry);
   entry.setFileDataPumpFunction(function() {
@@ -71500,15 +71642,16 @@ ZipFile.prototype.addEmptyDirectory = function(metadataPath, options) {
 
 var eocdrSignatureBuffer = bufferFrom([0x50, 0x4b, 0x05, 0x06]);
 
-ZipFile.prototype.end = function(options, finalSizeCallback) {
+ZipFile.prototype.end = function(options, calculatedTotalSizeCallback) {
   if (typeof options === "function") {
-    finalSizeCallback = options;
+    calculatedTotalSizeCallback = options;
     options = null;
   }
   if (options == null) options = {};
   if (this.ended) return;
   this.ended = true;
-  this.finalSizeCallback = finalSizeCallback;
+  if (this.errored) return;
+  this.calculatedTotalSizeCallback = calculatedTotalSizeCallback;
   this.forceZip64Eocd = !!options.forceZip64Format;
   if (options.comment) {
     if (typeof options.comment === "string") {
@@ -71535,7 +71678,7 @@ function writeToOutputStream(self, buffer) {
 function pumpFileDataReadStream(self, entry, readStream) {
   var crc32Watcher = new Crc32Watcher();
   var uncompressedSizeCounter = new ByteCounter();
-  var compressor = entry.compress ? new zlib.DeflateRaw() : new PassThrough();
+  var compressor = entry.compressionLevel !== 0 ? new zlib.DeflateRaw({level:entry.compressionLevel}) : new PassThrough();
   var compressedSizeCounter = new ByteCounter();
   readStream.pipe(crc32Watcher)
             .pipe(uncompressedSizeCounter)
@@ -71557,15 +71700,24 @@ function pumpFileDataReadStream(self, entry, readStream) {
   });
 }
 
+function determineCompressionLevel(options) {
+  if (options.compress != null && options.compressionLevel != null) {
+    if (!!options.compress !== !!options.compressionLevel) throw new Error("conflicting settings for compress and compressionLevel");
+  }
+  if (options.compressionLevel != null) return options.compressionLevel;
+  if (options.compress === false) return 0;
+  return 6;
+}
+
 function pumpEntries(self) {
-  if (self.allDone) return;
-  // first check if finalSize is finally known
-  if (self.ended && self.finalSizeCallback != null) {
-    var finalSize = calculateFinalSize(self);
-    if (finalSize != null) {
+  if (self.allDone || self.errored) return;
+  // first check if calculatedTotalSize is finally known
+  if (self.ended && self.calculatedTotalSizeCallback != null) {
+    var calculatedTotalSize = calculateTotalSize(self);
+    if (calculatedTotalSize != null) {
       // we have an answer
-      self.finalSizeCallback(finalSize);
-      self.finalSizeCallback = null;
+      self.calculatedTotalSizeCallback(calculatedTotalSize);
+      self.calculatedTotalSizeCallback = null;
     }
   }
 
@@ -71603,15 +71755,15 @@ function pumpEntries(self) {
   }
 }
 
-function calculateFinalSize(self) {
+function calculateTotalSize(self) {
   var pretendOutputCursor = 0;
   var centralDirectorySize = 0;
   for (var i = 0; i < self.entries.length; i++) {
     var entry = self.entries[i];
     // compression is too hard to predict
-    if (entry.compress) return -1;
+    if (entry.compressionLevel !== 0) return -1;
     if (entry.state >= Entry.READY_TO_PUMP_FILE_DATA) {
-      // if addReadStream was called without providing the size, we can't predict the final size
+      // if addReadStream was called without providing the size, we can't predict the total size
       if (entry.uncompressedSize == null) return -1;
     } else {
       // if we're still waiting for fs.stat, we might learn the size someday
@@ -71633,6 +71785,9 @@ function calculateFinalSize(self) {
     }
 
     centralDirectorySize += CENTRAL_DIRECTORY_RECORD_FIXED_SIZE + entry.utf8FileName.length + entry.fileComment.length;
+    if (!entry.forceDosTimestamp) {
+      centralDirectorySize += INFO_ZIP_UNIVERSAL_TIMESTAMP_EXTRA_FIELD_SIZE;
+    }
     if (useZip64Format) {
       centralDirectorySize += ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD_SIZE;
     }
@@ -71648,6 +71803,12 @@ function calculateFinalSize(self) {
   }
   endOfCentralDirectorySize += END_OF_CENTRAL_DIRECTORY_RECORD_SIZE + self.comment.length;
   return pretendOutputCursor + centralDirectorySize + endOfCentralDirectorySize;
+}
+
+function shouldIgnoreAdding(self) {
+  if (self.ended) throw new Error("cannot add entries after calling end()");
+  if (self.errored) return true;
+  return false;
 }
 
 var ZIP64_END_OF_CENTRAL_DIRECTORY_RECORD_SIZE = 56;
@@ -71775,6 +71936,7 @@ function Entry(metadataPath, isDirectory, options) {
   this.isDirectory = isDirectory;
   this.state = Entry.WAITING_FOR_METADATA;
   this.setLastModDate(options.mtime != null ? options.mtime : new Date());
+  this.forceDosTimestamp = !!options.forceDosTimestamp;
   if (options.mode != null) {
     this.setFileAttributesMode(options.mode);
   } else {
@@ -71794,10 +71956,9 @@ function Entry(metadataPath, isDirectory, options) {
     if (options.size != null) this.uncompressedSize = options.size;
   }
   if (isDirectory) {
-    this.compress = false;
+    this.compressionLevel = 0;
   } else {
-    this.compress = true; // default
-    if (options.compress != null) this.compress = !!options.compress;
+    this.compressionLevel = determineCompressionLevel(options);
   }
   this.forceZip64Format = !!options.forceZip64Format;
   if (options.fileComment) {
@@ -71818,6 +71979,7 @@ Entry.READY_TO_PUMP_FILE_DATA = 1;
 Entry.FILE_DATA_IN_PROGRESS = 2;
 Entry.FILE_DATA_DONE = 3;
 Entry.prototype.setLastModDate = function(date) {
+  this.mtime = date;
   var dosDateTime = dateToDosDateTime(date);
   this.lastModFileTime = dosDateTime.time;
   this.lastModFileDate = dosDateTime.date;
@@ -71924,17 +72086,42 @@ Entry.prototype.getDataDescriptor = function() {
   }
 };
 var CENTRAL_DIRECTORY_RECORD_FIXED_SIZE = 46;
+var INFO_ZIP_UNIVERSAL_TIMESTAMP_EXTRA_FIELD_SIZE = 9;
 var ZIP64_EXTENDED_INFORMATION_EXTRA_FIELD_SIZE = 28;
 Entry.prototype.getCentralDirectoryRecord = function() {
   var fixedSizeStuff = bufferAlloc(CENTRAL_DIRECTORY_RECORD_FIXED_SIZE);
   var generalPurposeBitFlag = FILE_NAME_IS_UTF8;
   if (!this.crcAndFileSizeKnown) generalPurposeBitFlag |= UNKNOWN_CRC32_AND_FILE_SIZES;
 
+  var izutefBuffer = EMPTY_BUFFER;
+  if (!this.forceDosTimestamp) {
+    // Here is one specification for this: https://commons.apache.org/proper/commons-compress/apidocs/org/apache/commons/compress/archivers/zip/X5455_ExtendedTimestamp.html
+    // See also the Info-ZIP source code unix/unix.c:set_extra_field() and zipfile.c:ef_scan_ut_time().
+    izutefBuffer = bufferAlloc(INFO_ZIP_UNIVERSAL_TIMESTAMP_EXTRA_FIELD_SIZE);
+    // 0x5455        Short       tag for this extra block type ("UT")
+    izutefBuffer.writeUInt16LE(0x5455, 0);
+    // TSize         Short       total data size for this block
+    izutefBuffer.writeUInt16LE(INFO_ZIP_UNIVERSAL_TIMESTAMP_EXTRA_FIELD_SIZE - 4, 2);
+    // See Info-ZIP source code zip.h for these constant values:
+    var EB_UT_FL_MTIME = (1 << 0);
+    var EB_UT_FL_ATIME = (1 << 1);
+    // Note that we set the atime flag despite not providing the atime field.
+    // The central directory version of this extra field is specified to never contain the atime field even when the flag is set.
+    // We set it to match the Info-ZIP behavior in order to minimize incompatibility with zip file readers that may have rigid input expectations.
+    // Flags         Byte        info bits
+    izutefBuffer.writeUInt8(EB_UT_FL_MTIME | EB_UT_FL_ATIME, 4);
+    // (ModTime)     Long        time of last modification (UTC/GMT)
+    var timestamp = Math.floor(this.mtime.getTime() / 1000);
+    if (timestamp < -0x80000000) timestamp = -0x80000000; // 1901-12-13T20:45:52.000Z
+    if (timestamp >  0x7fffffff) timestamp =  0x7fffffff; // 2038-01-19T03:14:07.000Z
+    izutefBuffer.writeUInt32LE(timestamp, 5);
+  }
+
   var normalCompressedSize = this.compressedSize;
   var normalUncompressedSize = this.uncompressedSize;
   var normalRelativeOffsetOfLocalHeader = this.relativeOffsetOfLocalHeader;
-  var versionNeededToExtract;
-  var zeiefBuffer;
+  var versionNeededToExtract = VERSION_NEEDED_TO_EXTRACT_UTF8;
+  var zeiefBuffer = EMPTY_BUFFER;
   if (this.useZip64Format()) {
     normalCompressedSize = 0xffffffff;
     normalUncompressedSize = 0xffffffff;
@@ -71955,9 +72142,6 @@ Entry.prototype.getCentralDirectoryRecord = function() {
     writeUInt64LE(zeiefBuffer, this.relativeOffsetOfLocalHeader, 20);
     // Disk Start Number       4 bytes    Number of the disk on which this file starts
     // (omit)
-  } else {
-    versionNeededToExtract = VERSION_NEEDED_TO_EXTRACT_UTF8;
-    zeiefBuffer = EMPTY_BUFFER;
   }
 
   // central file header signature   4 bytes  (0x02014b50)
@@ -71983,7 +72167,7 @@ Entry.prototype.getCentralDirectoryRecord = function() {
   // file name length                2 bytes
   fixedSizeStuff.writeUInt16LE(this.utf8FileName.length, 28);
   // extra field length              2 bytes
-  fixedSizeStuff.writeUInt16LE(zeiefBuffer.length, 30);
+  fixedSizeStuff.writeUInt16LE(izutefBuffer.length + zeiefBuffer.length, 30);
   // file comment length             2 bytes
   fixedSizeStuff.writeUInt16LE(this.fileComment.length, 32);
   // disk number start               2 bytes
@@ -72000,6 +72184,7 @@ Entry.prototype.getCentralDirectoryRecord = function() {
     // file name (variable size)
     this.utf8FileName,
     // extra field (variable size)
+    izutefBuffer,
     zeiefBuffer,
     // file comment (variable size)
     this.fileComment,
@@ -72008,10 +72193,18 @@ Entry.prototype.getCentralDirectoryRecord = function() {
 Entry.prototype.getCompressionMethod = function() {
   var NO_COMPRESSION = 0;
   var DEFLATE_COMPRESSION = 8;
-  return this.compress ? DEFLATE_COMPRESSION : NO_COMPRESSION;
+  return this.compressionLevel === 0 ? NO_COMPRESSION : DEFLATE_COMPRESSION;
 };
 
+// These are intentionally computed in the current system timezone
+// to match how the DOS encoding operates in this library.
+var minDosDate = new Date(1980, 0, 1);
+var maxDosDate = new Date(2107, 11, 31, 23, 59, 58);
 function dateToDosDateTime(jsDate) {
+  // Clamp out of bounds timestamps.
+  if (jsDate < minDosDate) jsDate = minDosDate;
+  else if (jsDate > maxDosDate) jsDate = maxDosDate;
+
   var date = 0;
   date |= jsDate.getDate() & 0x1f; // 1-31
   date |= ((jsDate.getMonth() + 1) & 0xf) << 5; // 0-11, 1-12
@@ -72623,6 +72816,320 @@ __webpack_unused_export__ = defaultContentType
 
 /***/ }),
 
+/***/ 4928:
+/***/ ((module) => {
+
+"use strict";
+
+
+function getDefaultExportFromCjs (x) {
+	return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, 'default') ? x['default'] : x;
+}
+
+const CRC_TABLE = new Int32Array([
+  0,
+  1996959894,
+  3993919788,
+  2567524794,
+  124634137,
+  1886057615,
+  3915621685,
+  2657392035,
+  249268274,
+  2044508324,
+  3772115230,
+  2547177864,
+  162941995,
+  2125561021,
+  3887607047,
+  2428444049,
+  498536548,
+  1789927666,
+  4089016648,
+  2227061214,
+  450548861,
+  1843258603,
+  4107580753,
+  2211677639,
+  325883990,
+  1684777152,
+  4251122042,
+  2321926636,
+  335633487,
+  1661365465,
+  4195302755,
+  2366115317,
+  997073096,
+  1281953886,
+  3579855332,
+  2724688242,
+  1006888145,
+  1258607687,
+  3524101629,
+  2768942443,
+  901097722,
+  1119000684,
+  3686517206,
+  2898065728,
+  853044451,
+  1172266101,
+  3705015759,
+  2882616665,
+  651767980,
+  1373503546,
+  3369554304,
+  3218104598,
+  565507253,
+  1454621731,
+  3485111705,
+  3099436303,
+  671266974,
+  1594198024,
+  3322730930,
+  2970347812,
+  795835527,
+  1483230225,
+  3244367275,
+  3060149565,
+  1994146192,
+  31158534,
+  2563907772,
+  4023717930,
+  1907459465,
+  112637215,
+  2680153253,
+  3904427059,
+  2013776290,
+  251722036,
+  2517215374,
+  3775830040,
+  2137656763,
+  141376813,
+  2439277719,
+  3865271297,
+  1802195444,
+  476864866,
+  2238001368,
+  4066508878,
+  1812370925,
+  453092731,
+  2181625025,
+  4111451223,
+  1706088902,
+  314042704,
+  2344532202,
+  4240017532,
+  1658658271,
+  366619977,
+  2362670323,
+  4224994405,
+  1303535960,
+  984961486,
+  2747007092,
+  3569037538,
+  1256170817,
+  1037604311,
+  2765210733,
+  3554079995,
+  1131014506,
+  879679996,
+  2909243462,
+  3663771856,
+  1141124467,
+  855842277,
+  2852801631,
+  3708648649,
+  1342533948,
+  654459306,
+  3188396048,
+  3373015174,
+  1466479909,
+  544179635,
+  3110523913,
+  3462522015,
+  1591671054,
+  702138776,
+  2966460450,
+  3352799412,
+  1504918807,
+  783551873,
+  3082640443,
+  3233442989,
+  3988292384,
+  2596254646,
+  62317068,
+  1957810842,
+  3939845945,
+  2647816111,
+  81470997,
+  1943803523,
+  3814918930,
+  2489596804,
+  225274430,
+  2053790376,
+  3826175755,
+  2466906013,
+  167816743,
+  2097651377,
+  4027552580,
+  2265490386,
+  503444072,
+  1762050814,
+  4150417245,
+  2154129355,
+  426522225,
+  1852507879,
+  4275313526,
+  2312317920,
+  282753626,
+  1742555852,
+  4189708143,
+  2394877945,
+  397917763,
+  1622183637,
+  3604390888,
+  2714866558,
+  953729732,
+  1340076626,
+  3518719985,
+  2797360999,
+  1068828381,
+  1219638859,
+  3624741850,
+  2936675148,
+  906185462,
+  1090812512,
+  3747672003,
+  2825379669,
+  829329135,
+  1181335161,
+  3412177804,
+  3160834842,
+  628085408,
+  1382605366,
+  3423369109,
+  3138078467,
+  570562233,
+  1426400815,
+  3317316542,
+  2998733608,
+  733239954,
+  1555261956,
+  3268935591,
+  3050360625,
+  752459403,
+  1541320221,
+  2607071920,
+  3965973030,
+  1969922972,
+  40735498,
+  2617837225,
+  3943577151,
+  1913087877,
+  83908371,
+  2512341634,
+  3803740692,
+  2075208622,
+  213261112,
+  2463272603,
+  3855990285,
+  2094854071,
+  198958881,
+  2262029012,
+  4057260610,
+  1759359992,
+  534414190,
+  2176718541,
+  4139329115,
+  1873836001,
+  414664567,
+  2282248934,
+  4279200368,
+  1711684554,
+  285281116,
+  2405801727,
+  4167216745,
+  1634467795,
+  376229701,
+  2685067896,
+  3608007406,
+  1308918612,
+  956543938,
+  2808555105,
+  3495958263,
+  1231636301,
+  1047427035,
+  2932959818,
+  3654703836,
+  1088359270,
+  936918e3,
+  2847714899,
+  3736837829,
+  1202900863,
+  817233897,
+  3183342108,
+  3401237130,
+  1404277552,
+  615818150,
+  3134207493,
+  3453421203,
+  1423857449,
+  601450431,
+  3009837614,
+  3294710456,
+  1567103746,
+  711928724,
+  3020668471,
+  3272380065,
+  1510334235,
+  755167117
+]);
+function ensureBuffer(input) {
+  if (Buffer.isBuffer(input)) {
+    return input;
+  }
+  if (typeof input === "number") {
+    return Buffer.alloc(input);
+  } else if (typeof input === "string") {
+    return Buffer.from(input);
+  } else {
+    throw new Error("input must be buffer, number, or string, received " + typeof input);
+  }
+}
+function bufferizeInt(num) {
+  const tmp = ensureBuffer(4);
+  tmp.writeInt32BE(num, 0);
+  return tmp;
+}
+function _crc32(buf, previous) {
+  buf = ensureBuffer(buf);
+  if (Buffer.isBuffer(previous)) {
+    previous = previous.readUInt32BE(0);
+  }
+  let crc = ~~previous ^ -1;
+  for (var n = 0; n < buf.length; n++) {
+    crc = CRC_TABLE[(crc ^ buf[n]) & 255] ^ crc >>> 8;
+  }
+  return crc ^ -1;
+}
+function crc32() {
+  return bufferizeInt(_crc32.apply(null, arguments));
+}
+crc32.signed = function() {
+  return _crc32.apply(null, arguments);
+};
+crc32.unsigned = function() {
+  return _crc32.apply(null, arguments) >>> 0;
+};
+var bufferCrc32 = crc32;
+
+const index = /*@__PURE__*/getDefaultExportFromCjs(bufferCrc32);
+
+module.exports = index;
+
+
+/***/ }),
+
 /***/ 3420:
 /***/ ((module) => {
 
@@ -72843,7 +73350,7 @@ module.exports = /*#__PURE__*/JSON.parse('{"uChars":[128,165,169,178,184,216,226
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('[["a140","",62],["a180","",32],["a240","",62],["a280","",32],["a2ab","",5],["a2e3","€"],["a2ef",""],["a2fd",""],["a340","",62],["a380","",31,"　"],["a440","",62],["a480","",32],["a4f4","",10],["a540","",62],["a580","",32],["a5f7","",7],["a640","",62],["a680","",32],["a6b9","",7],["a6d9","",6],["a6ec",""],["a6f3",""],["a6f6","",8],["a740","",62],["a780","",32],["a7c2","",14],["a7f2","",12],["a896","",10],["a8bc",""],["a8bf","ǹ"],["a8c1",""],["a8ea","",20],["a958",""],["a95b",""],["a95d",""],["a989","〾⿰",11],["a997","",12],["a9f0","",14],["aaa1","",93],["aba1","",93],["aca1","",93],["ada1","",93],["aea1","",93],["afa1","",93],["d7fa","",4],["f8a1","",93],["f9a1","",93],["faa1","",93],["fba1","",93],["fca1","",93],["fda1","",93],["fe50","⺁⺄㑳㑇⺈⺋㖞㘚㘎⺌⺗㥮㤘㧏㧟㩳㧐㭎㱮㳠⺧⺪䁖䅟⺮䌷⺳⺶⺷䎱䎬⺻䏝䓖䙡䙌"],["fe80","䜣䜩䝼䞍⻊䥇䥺䥽䦂䦃䦅䦆䦟䦛䦷䦶䲣䲟䲠䲡䱷䲢䴓",6,"䶮",93]]');
+module.exports = /*#__PURE__*/JSON.parse('[["a140","",62],["a180","",32],["a240","",62],["a280","",32],["a2ab","",5],["a2e3","€"],["a2ef",""],["a2fd",""],["a340","",62],["a380","",31,"　"],["a440","",62],["a480","",32],["a4f4","",10],["a540","",62],["a580","",32],["a5f7","",7],["a640","",62],["a680","",32],["a6b9","",7],["a6d9","",6],["a6ec",""],["a6f3",""],["a6f6","",8],["a740","",62],["a780","",32],["a7c2","",14],["a7f2","",12],["a896","",10],["a8bc","ḿ"],["a8bf","ǹ"],["a8c1",""],["a8ea","",20],["a958",""],["a95b",""],["a95d",""],["a989","〾⿰",11],["a997","",12],["a9f0","",14],["aaa1","",93],["aba1","",93],["aca1","",93],["ada1","",93],["aea1","",93],["afa1","",93],["d7fa","",4],["f8a1","",93],["f9a1","",93],["faa1","",93],["fba1","",93],["fca1","",93],["fda1","",93],["fe50","⺁⺄㑳㑇⺈⺋㖞㘚㘎⺌⺗㥮㤘㧏㧟㩳㧐㭎㱮㳠⺧⺪䁖䅟⺮䌷⺳⺶⺷䎱䎬⺻䏝䓖䙡䙌"],["fe80","䜣䜩䝼䞍⻊䥇䥺䥽䦂䦃䦅䦆䦟䦛䦷䦶䲣䲟䲠䲡䱷䲢䴓",6,"䶮",93],["8135f437",""]]');
 
 /***/ }),
 
