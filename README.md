@@ -17,7 +17,7 @@ Action for installing and configuring __Conan__ package manager to `PATH` of the
 ## Example usage
 
 ```yaml
-uses: imesense/gha-setup-conan@v0.1
+uses: imesense/gha-setup-conan@v0.2
 with:
   version: '2.5.0'
 ```
