@@ -1,6 +1,6 @@
 {
   "name": "gha-setup-conan",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Action for installing and configuring Conan package manager to PATH of the runner",
   "author": "acidicMercury8",
   "license": "MIT",
